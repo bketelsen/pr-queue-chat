@@ -3,8 +3,10 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act } from 'react-dom/test-utils';
 import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PullRequestRef } from './github';
 import plugin from './index';
 import PullRequestPanel from './PullRequestPanel';
+import { useShownPullRequest } from './shownPullRequest';
 
 // The Code tab's diff libraries need a browser; the tab stands in as its file paths, what it was
 // given of the threads, the commits and the chosen commit, how many review comments loaded of a
@@ -142,6 +144,49 @@ describe('PullRequestPanel', () => {
     const view = await show(request);
     expect(view.getByText(EMPTY)).toBeTruthy();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('records the pull request it shows for its room until it unmounts', async () => {
+    let shown: PullRequestRef | undefined;
+    function ShownProbe() {
+      shown = useShownPullRequest('!room:example.org');
+      return null;
+    }
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const page = (withPanel: boolean) => (
+      <QueryClientProvider client={client}>
+        {withPanel ? <PullRequestPanel roomId="!room:example.org" request={REQUEST} /> : null}
+        <ShownProbe />
+      </QueryClientProvider>
+    );
+    const view = await renderPluginComponent(page(true), { id: 'pull-requests', plugin });
+    expect(shown).toEqual(REQUEST);
+    view.rerender(page(false));
+    expect(shown).toBeUndefined();
+  });
+
+  it('leaves the record of the panel that took its place when it unmounts', async () => {
+    let shown: PullRequestRef | undefined;
+    function ShownProbe() {
+      shown = useShownPullRequest('!room:example.org');
+      return null;
+    }
+    const next = { ...REQUEST, number: 201 };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // A new panel mounts while the one it replaces still moves out.
+    const page = (withOld: boolean) => (
+      <QueryClientProvider client={client}>
+        {withOld ? (
+          <PullRequestPanel key="old" roomId="!room:example.org" request={REQUEST} />
+        ) : null}
+        <PullRequestPanel key="new" roomId="!room:example.org" request={next} />
+        <ShownProbe />
+      </QueryClientProvider>
+    );
+    const view = await renderPluginComponent(page(true), { id: 'pull-requests', plugin });
+    expect(shown).toEqual(next);
+    view.rerender(page(false));
+    expect(shown).toEqual(next);
   });
 
   it('shows the header', async () => {
@@ -664,7 +709,11 @@ describe('PullRequestPanel', () => {
 
     it('offers one token form under the rate limit, and each failed part its own Retry', async () => {
       const limited = () =>
-        new Response('{}', { status: 403, headers: { 'x-ratelimit-remaining': '0' } });
+        new Response('{}', {
+          status: 403,
+          // A limit that reset long ago, so that each request still goes to GitHub.
+          headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '0' },
+        });
       let limit = true;
       serve(withHead());
       const served = fetchMock.getMockImplementation()!;
@@ -706,7 +755,11 @@ describe('PullRequestPanel', () => {
 
     it('leaves the header whole when the checks do not load', async () => {
       const limited = () =>
-        new Response('{}', { status: 403, headers: { 'x-ratelimit-remaining': '0' } });
+        new Response('{}', {
+          status: 403,
+          // A limit that reset long ago, so that each request still goes to GitHub.
+          headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '0' },
+        });
       serve(withHead(), { checks: limited(), statuses: limited() });
       const view = await show();
       expect(await view.findByText('Checks unavailable')).toBeTruthy();

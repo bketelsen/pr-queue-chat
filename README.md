@@ -11,6 +11,19 @@ A [MindRoom Chat](https://github.com/mindroom-ai/mindroom-chat) client plugin fo
 
 The card and most of the panel are ported from [T3 Code](https://github.com/pingdotgg/t3code) (MIT, see [NOTICE](NOTICE)); each ported file names its T3 Code source in its first line.
 
+## Pull requests of a thread
+
+A thread can be linked to the pull requests it works on. MindRoom's backend plugin `pull-requests` writes the links into the room's state, one state event per thread and pull request, which this plugin only reads:
+
+- type: `com.mindroom.thread.pull_request`
+- state key: `["<thread root event ID>","<owner>/<repo>#<number>"]` as compact JSON (no spaces), with the owner and repository in lower case
+- content: `{"url","set_by","set_at"}`: the pull request's URL, `https://github.com/<owner>/<repo>/pull/<number>` with the owner and repository in lower case, who linked it, and when (UTC, ISO 8601); a pull request that was unlinked has the content `{}`
+
+A linked pull request shows as a chip: its state's icon, its number and, while a GitHub token is stored, the mark of its checks, with the repository's name before the number when the room's links span more than one repository.
+
+- On a thread's card in the Compact view: the chips of the first two pull requests linked to it (one on a phone), then `+N` for the rest. A click on a chip opens the thread and the pull request in the side panel; elsewhere on the card, the click opens the thread as before. These chips take no focus, since the card is one button.
+- Under the room header, while a thread is open: a chip for each of its pull requests, as a button that opens the pull request in the side panel. While the panel is open, the chip of the pull request it shows is pressed.
+
 ## Build it into a client
 
 The plugin is built into a MindRoom Chat client by listing its directory in `MINDROOM_CLIENT_PLUGINS` when the client is built or run (see "Client plugins" in the client's `docs/architecture.md`):
@@ -37,11 +50,21 @@ The `/src` filter matters: without it, vitest also collects the client's own tes
 ln -s /path/to/mindroom-chat .mindroom-chat
 ```
 
-`tsconfig.json` resolves `@mindroom/client-sdk/*` to `.mindroom-chat/src/client-sdk/*` and the shared packages through `.mindroom-chat/node_modules`.
+`tsconfig.json` resolves `@mindroom/client-sdk/*` to `.mindroom-chat/src/client-sdk/*` and the shared packages through `.mindroom-chat/node_modules`; for the end-to-end specs in `e2e/`, `@mindroom/e2e/*` to the client's `e2e/helpers/` and `@playwright/test` to the client's copy.
+
+The end-to-end spec `e2e/threadPullRequests.spec.ts` runs in the client's Playwright against a production build with this plugin, on an e2e slot of its own (the client's `docs/development.md`, "A client plugin in its own repository"). From the client's checkout, with absolute directories:
+
+```sh
+E2E_PLUGIN_DIRS=/path/to/pull-request-client-plugin MINDROOM_CLIENT_PLUGINS=/path/to/pull-request-client-plugin just e2e-slot 3 --preview npx playwright test --project=pull-request-client-plugin
+```
+
+The page answers GitHub's API itself, so no request leaves the test. With `MRPR_SHOTS=<directory>` (an absolute one: the run's working directory is the slot's snapshot), it saves screenshots of a thread's pull requests: the Compact view in the light and dark themes, an open thread with its strip and the panel, and the Compact view on a phone.
 
 ## GitHub token
 
 Public pull requests need no token. For a private repository, or to avoid GitHub's rate limit for requests without one, a person can enter a GitHub token in the plugin's panel. The token is kept in the browser's localStorage for the signed-in account, where any script running on the page can read it. Requests go to `https://api.github.com` and nowhere else; the token is sent only there, and only when one is stored. The plugin only reads (`GET`).
+
+The chips of a thread's pull requests ask GitHub for each pull request once it has been on screen: one request each, and two more for its checks when a token is stored. A chip asks again when it shows after its answer is more than two minutes old, and not when the tab regains focus. Without a token, GitHub allows 60 requests an hour for the address, shared with the panel, and the chips show no checks marks. After GitHub answers with its rate limit, the plugin asks it nothing more until the limit resets.
 
 Use a fine-grained token with read-only access to these permissions of the repositories, as GitHub's [permissions required for fine-grained personal access tokens](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens) lists them for the endpoints the plugin calls (every fine-grained token also has Metadata: read):
 
