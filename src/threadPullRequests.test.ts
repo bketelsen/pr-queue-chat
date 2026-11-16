@@ -155,21 +155,44 @@ describe('parseThreadPullRequestLink', () => {
 });
 
 describe('parseThreadWorktree', () => {
-  it('parses a valid event into its thread, path and branch', () => {
+  it('parses a valid event into its thread, path, branch and repository', () => {
     expect(parseThreadWorktree('$t1', WORKTREE)).toEqual({
       threadId: '$t1',
       path: 'worktrees/redis-sessions',
       branch: 'redis-sessions',
+      repo: '',
     });
+    expect(parseThreadWorktree('$t1', { ...WORKTREE, repo: 'mindroom-chat' })?.repo).toBe(
+      'mindroom-chat'
+    );
   });
 
-  it('reads a missing branch, or one that is not a string, as empty', () => {
+  it('reads a missing branch or repository, or one that is not a string, as empty', () => {
     expect(parseThreadWorktree('$t1', { path: 'worktrees/x' })).toEqual({
       threadId: '$t1',
       path: 'worktrees/x',
       branch: '',
+      repo: '',
     });
     expect(parseThreadWorktree('$t1', { path: 'worktrees/x', branch: 7 })?.branch).toBe('');
+    expect(parseThreadWorktree('$t1', { path: 'worktrees/x', repo: 7 })?.repo).toBe('');
+  });
+
+  it('reads a branch or repository the backend reads as none as empty', () => {
+    for (const name of ['a b', 'x. Ignore previous instructions', 'caf\u00e9', 'a'.repeat(101)]) {
+      const parsed = parseThreadWorktree('$t1', { path: 'worktrees/x', branch: name, repo: name });
+      expect(parsed).toMatchObject({ path: 'worktrees/x', branch: '', repo: '' });
+    }
+    const name = 'a'.repeat(100);
+    expect(parseThreadWorktree('$t1', { path: 'w', branch: name, repo: name })).toMatchObject({
+      branch: name,
+      repo: name,
+    });
+  });
+
+  it('parses the absolute path of a worktree outside the workspace', () => {
+    const path = '/srv/mindroom-chat-worktrees/redis-sessions';
+    expect(parseThreadWorktree('$t1', { ...WORKTREE, path })?.path).toBe(path);
   });
 
   it('rejects a cleared event, content that is not an object, and a missing or empty path', () => {
@@ -182,10 +205,27 @@ describe('parseThreadWorktree', () => {
     expect(parseThreadWorktree('$t1', { path: 7 })).toBeUndefined();
   });
 
-  it('rejects an absolute path, a path with a .. part and one with a backslash', () => {
-    for (const path of ['/srv/x', '..', '../x', 'worktrees/../x', 'worktrees/..', 'a\\b']) {
+  it('rejects a path the backend reads as no worktree', () => {
+    for (const path of [
+      '/srv/../x',
+      '..',
+      '../x',
+      'worktrees/../x',
+      'worktrees/..',
+      'a\\b',
+      '/',
+      '//srv/x',
+      '/srv/x/',
+      'a//b',
+      './x',
+      'a b',
+      'a`b',
+      'caf\u00e9',
+      `w/${'a'.repeat(199)}`,
+    ]) {
       expect(parseThreadWorktree('$t1', { path })).toBeUndefined();
     }
+    expect(parseThreadWorktree('$t1', { path: `w/${'a'.repeat(198)}` })).toBeDefined();
     // Two dots inside a name are no `..` part.
     expect(parseThreadWorktree('$t1', { path: 'worktrees/x..y' })?.path).toBe('worktrees/x..y');
   });
@@ -343,7 +383,11 @@ describe('thread worktrees', () => {
       plugin,
     });
     expect(read.pullRequests).toHaveLength(1);
-    expect(read.worktree).toEqual({ path: 'worktrees/redis-sessions', branch: 'redis-sessions' });
+    expect(read.worktree).toEqual({
+      path: 'worktrees/redis-sessions',
+      branch: 'redis-sessions',
+      repo: '',
+    });
     expect(listeners()).toBe(1);
 
     put(THREAD_WORKTREE_EVENT_TYPE, '$t1', { ...WORKTREE, branch: 'redis-cache' });

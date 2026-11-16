@@ -107,6 +107,35 @@ describe('ThreadCardPullRequests', () => {
     expect(page.navigateRoomThread).not.toHaveBeenCalled();
   });
 
+  it("draws a worktree's repository only in a room that works on several", async () => {
+    const worktree = { ...WORKTREE, repo: 'mindroom-chat' };
+    const name =
+      'Worktree worktrees/redis-sessions, repository mindroom-chat, branch redis-sessions';
+    // The chip's text in one room, which is unmounted before the next one is shown.
+    const drawn = async (room: Room) => {
+      const view = await show(room);
+      const chip = view.getByRole('img', { name });
+      const parts = [...chip.querySelectorAll('.mrpr-branch-chip-names > span')];
+      view.unmount();
+      return parts.map((part) => part.textContent);
+    };
+    const other = { ...WORKTREE, thread: '$other' };
+    expect(await drawn(roomWith([], [worktree, { ...other, repo: 'mindroom-chat' }]))).toEqual([
+      'redis-sessions',
+    ]);
+    expect(await drawn(roomWith([], [worktree, { ...other, repo: 'mindroom' }]))).toEqual([
+      'mindroom-chat',
+      'redis-sessions',
+    ]);
+    const links = [
+      { thread: '$other', number: 1 },
+      { thread: '$other', repo: 'mindroom', number: 2 },
+    ];
+    expect(await drawn(roomWith(links, [worktree]))).toEqual(['mindroom-chat', 'redis-sessions']);
+    // A worktree whose event names no repository is not one more repository.
+    expect(await drawn(roomWith([], [worktree, other]))).toEqual(['redis-sessions']);
+  });
+
   it('shows only the pull requests of a thread with links and a worktree', async () => {
     const view = await show(roomWith([{ number: 1 }], [WORKTREE]));
     expect(chips(view).map((chip) => chip.textContent)).toEqual(['#1']);
