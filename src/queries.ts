@@ -1,4 +1,10 @@
-import { useQueries, useQuery, type Query, type QueryClient } from '@tanstack/react-query';
+import {
+  isCancelledError,
+  useQueries,
+  useQuery,
+  type Query,
+  type QueryClient,
+} from '@tanstack/react-query';
 import {
   fetchBehindBy,
   fetchChecks,
@@ -13,14 +19,17 @@ import {
   fetchReviews,
   GitHubError,
   GitHubWriteError,
+  type GitHubAuth,
   type PullRequest,
   type PullRequestRef,
 } from './github';
-import { useGitHubToken, useStoredToken } from './token';
+import { useGitHubAccess, type AccessKey, type GitHubAccess } from './token';
 
 // A refusal GitHub gave twice would be the same again; only a failed request is worth another try.
+// A read cancelled because its key no longer names the access (`authFor`) is not tried again.
 const retry = (count: number, error: Error) =>
-  (error instanceof GitHubError || error instanceof GitHubWriteError) && error.kind !== 'failed'
+  isCancelledError(error) ||
+  ((error instanceof GitHubError || error instanceof GitHubWriteError) && error.kind !== 'failed')
     ? false
     : count < 2;
 
@@ -36,35 +45,42 @@ const lower = (name: string | undefined) => name?.toLowerCase();
 export const pullRequestKey = (ref: PullRequestRef | undefined) =>
   ['pull-requests', 'pr', lower(ref?.owner), lower(ref?.repo), ref?.number] as const;
 
-/** The key of what `useRepository` reads of a pull request's repository. */
+/** What the keys of what `useRepository` reads of a pull request's repository start with. */
 export const repositoryKey = (ref: PullRequestRef | undefined) =>
   ['pull-requests', 'repo', lower(ref?.owner), lower(ref?.repo)] as const;
 
-// The token's value never goes in a key (keys show in devtools and error reports); whether there is
-// one does, so a result for a public pull request is not reused for the private view of it.
-const keyOf = (ref: PullRequestRef | undefined, tokenSet: boolean) =>
-  [...pullRequestKey(ref), tokenSet] as const;
+// The token's value never goes in a key (keys show in devtools and error reports); how GitHub is
+// reached does (`GitHubAccess.key`), so a result for a public pull request is not reused for the
+// private view of it, nor one read through MindRoom for one read with a token.
+const keyOf = (ref: PullRequestRef | undefined, access: AccessKey) =>
+  [...pullRequestKey(ref), access] as const;
 
 /**
  * After a write: everything read of the pull request is stale and asked again, and the promise
  * settles once the pull request itself is read again. Its other parts (the files, the checks,
  * the comments) are not waited for: a large pull request's files take long, and nothing that
  * depends on the write reads them. Resolves to whether that read worked: false leaves on screen
- * the pull request from before the write. True also when nothing on screen reads it.
+ * the pull request from before the write. True also when nothing on screen reads it. `access`,
+ * the key of the access the write went with, is the read that counts: what another room shows
+ * of the pull request with another access (anonymously, as not found) is asked again too, each
+ * with the access its own key names (`authFor`), but says nothing of this write.
  */
 export async function refreshPullRequest(
   queryClient: QueryClient,
-  ref: PullRequestRef
+  ref: PullRequestRef,
+  access: AccessKey
 ): Promise<boolean> {
   const queryKey = pullRequestKey(ref);
-  // The pull request's own query has only the token's presence after the start they all share.
-  const own = (query: Query) => query.queryKey.length === queryKey.length + 1;
+  const used = [...queryKey, access];
+  // The pull request's own query has only how GitHub is reached after the start they all share.
+  const own = (query: Query) => query.queryKey.length === used.length;
+  const read = (query: Query) => own(query) && query.queryKey[queryKey.length] === access;
   // Each query once: asked again by both, the first request would be dropped for the second.
-  void queryClient.invalidateQueries({ queryKey, predicate: (query) => !own(query) });
-  await queryClient.invalidateQueries({ queryKey, predicate: own });
+  void queryClient.invalidateQueries({ queryKey, predicate: (query) => !read(query) });
+  await queryClient.invalidateQueries({ queryKey, predicate: read });
   // Only what is on screen was asked again; a failure of an earlier read, as the one without a
   // token of a private pull request, is not this read's.
-  const shown = queryClient.getQueryCache().findAll({ queryKey, predicate: own, type: 'active' });
+  const shown = queryClient.getQueryCache().findAll({ queryKey, predicate: read, type: 'active' });
   return shown.every((query) => query.state.status !== 'error');
 }
 
@@ -83,41 +99,35 @@ export const NO_FOCUS_REFETCH = { refetchOnWindowFocus: false };
 // The query of one pull request, the same for `usePullRequest` and `usePullRequests`.
 const pullRequestQuery = (
   ref: PullRequestRef | undefined,
-  tokenSet: boolean,
-  storedToken: () => string | undefined,
+  access: GitHubAccess,
   options: RefetchOptions
 ) => ({
-  queryKey: keyOf(ref, tokenSet),
+  queryKey: keyOf(ref, access.key),
   queryFn: ({ signal }: { signal: AbortSignal }) =>
-    fetchPullRequest(ref as PullRequestRef, storedToken(), signal),
-  enabled: ref !== undefined,
+    fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal),
+  enabled: ref !== undefined && !access.pending,
   staleTime: STALE_TIME,
   retry,
   ...options,
 });
 
 export function usePullRequest(ref: PullRequestRef | undefined, options: RefetchOptions = {}) {
-  const { token } = useGitHubToken();
-  const storedToken = useStoredToken();
-  return useQuery(pullRequestQuery(ref, token !== undefined, storedToken, options));
+  return useQuery(pullRequestQuery(ref, useGitHubAccess(), options));
 }
 
 /** The pull requests `refs` as `usePullRequest` reads each, through the same queries. */
 export function usePullRequests(refs: readonly PullRequestRef[], options: RefetchOptions = {}) {
-  const { token } = useGitHubToken();
-  const storedToken = useStoredToken();
-  return useQueries({
-    queries: refs.map((ref) => pullRequestQuery(ref, token !== undefined, storedToken, options)),
-  });
+  const access = useGitHubAccess();
+  return useQueries({ queries: refs.map((ref) => pullRequestQuery(ref, access, options)) });
 }
 
 export function usePullRequestFiles(ref: PullRequestRef | undefined, enabled: boolean) {
-  const { token } = useGitHubToken();
-  const storedToken = useStoredToken();
+  const access = useGitHubAccess();
   return useQuery({
-    queryKey: [...keyOf(ref, token !== undefined), 'files'] as const,
-    queryFn: ({ signal }) => fetchPullRequestFiles(ref as PullRequestRef, storedToken(), signal),
-    enabled: enabled && ref !== undefined,
+    queryKey: [...keyOf(ref, access.key), 'files'] as const,
+    queryFn: ({ signal }) =>
+      fetchPullRequestFiles(ref as PullRequestRef, access.authFor(access.key), signal),
+    enabled: enabled && ref !== undefined && !access.pending,
     staleTime: STALE_TIME,
     retry,
   });
@@ -125,24 +135,25 @@ export function usePullRequestFiles(ref: PullRequestRef | undefined, enabled: bo
 
 /**
  * What the viewer may do in the pull request's repository, and how it merges. GraphQL needs a
- * token, so without one nothing is asked. It changes rarely, so a panel opened again within ten
- * minutes reuses it; one opened after the token changed, which makes every answer stale, asks
- * again, as another token is another permission. A refusal is not asked again on mount, until
- * the token changes, which forgets it (`useGitHubToken`).
+ * token or MindRoom's connection, so without either nothing is asked. It changes rarely, so a
+ * panel opened again within ten minutes reuses it; one opened after the token or the connection
+ * changed, which makes every answer stale, asks again, as another account is another permission.
+ * A refusal is not asked again on mount, until the token or the connection changes, which
+ * forgets it (`useGitHubToken`, `useGitHubAccess`).
  */
 export function useRepository(ref: PullRequestRef | undefined) {
-  const { token } = useGitHubToken();
-  const storedToken = useStoredToken();
+  const access = useGitHubAccess();
   return useQuery({
-    queryKey: repositoryKey(ref),
+    // Under how GitHub is reached, as each account may do other things there.
+    queryKey: [...repositoryKey(ref), access.key] as const,
     queryFn: ({ signal }) => {
       const { owner, repo } = ref as PullRequestRef;
-      const stored = storedToken();
+      const auth = access.authFor(access.key);
       // Forgotten after the render that enabled the query; no request goes without one.
-      if (stored === undefined) throw new GitHubWriteError('badToken', 0);
-      return fetchRepository(owner, repo, stored, signal);
+      if (auth === undefined) throw new GitHubWriteError('badToken', 0);
+      return fetchRepository(owner, repo, auth, signal);
     },
-    enabled: token !== undefined && ref !== undefined,
+    enabled: access.via !== undefined && ref !== undefined,
     staleTime: 600_000,
     retryOnMount: false,
     retry,
@@ -151,41 +162,40 @@ export function useRepository(ref: PullRequestRef | undefined) {
 
 /**
  * Where the pull request's branch points on GitHub now, null once it is gone: what tells whether
- * the branch can still be deleted. GraphQL needs a token, so without one nothing is asked. Keyed
- * under the pull request, so the refetch after an action (a deletion among them) asks again.
+ * the branch can still be deleted. GraphQL needs a token or MindRoom's connection, so without
+ * either nothing is asked. Keyed under the pull request, so the refetch after an action (a
+ * deletion among them) asks again.
  */
 export function useHeadBranchSha(ref: PullRequestRef, pr: PullRequest, enabled: boolean) {
-  const { token } = useGitHubToken();
-  const storedToken = useStoredToken();
+  const access = useGitHubAccess();
   return useQuery({
-    queryKey: [...keyOf(ref, true), 'head-branch', pr.headRepoId, pr.headRef] as const,
+    queryKey: [...keyOf(ref, access.key), 'head-branch', pr.headRepoId, pr.headRef] as const,
     queryFn: ({ signal }) => {
-      const stored = storedToken();
+      const auth = access.authFor(access.key);
       // Forgotten after the render that enabled the query; no request goes without one.
-      if (stored === undefined) throw new GitHubWriteError('badToken', 0);
-      return fetchHeadBranch(ref, pr, stored, signal);
+      if (auth === undefined) throw new GitHubWriteError('badToken', 0);
+      return fetchHeadBranch(ref, pr, auth, signal);
     },
     select: (head) => head.sha,
-    enabled: enabled && token !== undefined,
+    enabled: enabled && access.via !== undefined,
     staleTime: STALE_TIME,
     retry,
   });
 }
 
-/** The query of one list or lookup, keyed under the pull request with the token's presence. */
+/** The query of one list or lookup, keyed under the pull request with how GitHub is reached. */
 function useRefQuery<T>(
   ref: PullRequestRef | undefined,
   enabled: boolean,
   part: readonly (string | undefined)[],
-  load: (ref: PullRequestRef, token: string | undefined, signal: AbortSignal) => Promise<T>,
+  load: (ref: PullRequestRef, token: GitHubAuth | undefined, signal: AbortSignal) => Promise<T>,
   options: RefetchOptions = {}
 ) {
-  const { token } = useGitHubToken();
-  const storedToken = useStoredToken();
+  const access = useGitHubAccess();
   return useQuery({
-    queryKey: [...keyOf(ref, token !== undefined), ...part] as const,
-    queryFn: ({ signal }) => load(ref as PullRequestRef, storedToken(), signal),
-    enabled: enabled && ref !== undefined,
+    queryKey: [...keyOf(ref, access.key), ...part] as const,
+    queryFn: ({ signal }) => load(ref as PullRequestRef, access.authFor(access.key), signal),
+    enabled: enabled && ref !== undefined && !access.pending,
     staleTime: STALE_TIME,
     retry,
     ...options,

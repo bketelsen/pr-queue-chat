@@ -135,7 +135,11 @@ export const en = {
     hint: {
       noAccess:
         'GitHub refused it. The saved token may not have write access to this repository (Pull requests and Contents: Read and write).',
+      noAccessServer:
+        'GitHub refused it. The GitHub App connected in MindRoom may not have write access to this repository (Pull requests and Contents: Read and write).',
       badToken: 'GitHub refused the saved token.',
+      badConnection:
+        'GitHub refused your account connected in MindRoom. Connect GitHub again in MindRoom.',
       rateLimited: "GitHub's rate limit is used up for now. Try again later.",
       server: 'GitHub answered with an error.',
       branchMoved: 'The branch has new commits since this pull request, so it was not deleted.',
@@ -344,8 +348,12 @@ export const en = {
     notFound: 'GitHub did not find this pull request. A private repository needs a token.',
     rateLimited: "GitHub's rate limit was reached.",
     badToken: 'GitHub refused the saved token.',
+    badConnection:
+      'GitHub refused your account connected in MindRoom. Connect GitHub again in MindRoom.',
     notFoundWithToken:
       'GitHub did not find this pull request. The saved token may not be able to read this repository.',
+    notFoundWithServer:
+      'GitHub did not find this pull request. The GitHub App connected in MindRoom may not be installed on this repository.',
     failed: 'GitHub could not be reached.',
     failedStatus: 'GitHub answered with status {{status}}.',
     retry: 'Try again',
@@ -361,5 +369,12 @@ export const en = {
       badToken: 'Save another token to replace it.',
     },
     note: "The token stays in this browser, where the page's scripts can read it.",
+    // While no token is stored and the room's MindRoom server has the person's GitHub connected.
+    connected: 'Using your GitHub account connected in MindRoom (@{{login}}).',
+    connectedNoLogin: 'Using your GitHub account connected in MindRoom.',
+    overrides: 'A token saved here is used instead.',
+    useToken: 'Use a token instead',
+    // Closes the form opened by Use a token instead, keeping MindRoom's connection.
+    cancel: 'Cancel',
   },
 };

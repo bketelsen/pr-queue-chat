@@ -17,6 +17,7 @@ import { usePullRequestStatus } from './pullRequestStatus';
 import { NO_FOCUS_REFETCH, usePullRequests } from './queries';
 import { pluginRootStyle } from './theme';
 import { useThreadPullRequests, type ThreadWorktree } from './threadPullRequests';
+import { RoomGitHub } from './token';
 
 /** The most code points a worktree's path shows, shortened in its middle so its leaf stays. */
 const PATH_MAX = 40;
@@ -28,10 +29,25 @@ const ANSWERED_ONLY = { ...NO_FOCUS_REFETCH, refetchOnMount: false, retryOnMount
 
 export function ThreadDetails({ room, threadId }: ThreadDetailProps) {
   const { pullRequests, worktree } = useThreadPullRequests(room, threadId);
-  // The same queries as each pull request's below, so they ask GitHub nothing more.
-  const heads = usePullRequests(pullRequests, ANSWERED_ONLY).map((query) => query.data?.headRef);
   // A thread can lose its last link or its worktree while a surface shows it: it then draws none.
   if (pullRequests.length === 0 && !worktree) return null;
+  return (
+    <RoomGitHub roomId={room.roomId}>
+      <Details pullRequests={pullRequests} worktree={worktree} />
+    </RoomGitHub>
+  );
+}
+
+// Inside `RoomGitHub`, so the heads are read with the room's access, as each chip reads them.
+function Details({
+  pullRequests,
+  worktree,
+}: {
+  pullRequests: readonly PullRequestRef[];
+  worktree: ThreadWorktree | undefined;
+}) {
+  // The same queries as each pull request's below, so they ask GitHub nothing more.
+  const heads = usePullRequests(pullRequests, ANSWERED_ONLY).map((query) => query.data?.headRef);
   return (
     <div className="mrpr-root mrpr-details" style={pluginRootStyle()}>
       {pullRequests.map((pullRequest) => (

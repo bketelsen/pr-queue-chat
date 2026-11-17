@@ -1,19 +1,20 @@
 import { usePluginTranslation } from '@mindroom/client-sdk/core';
 import { GitHubError } from './github';
-import { TokenForm, useGitHubToken, usePanelTokenFormFor } from './token';
+import { TokenForm, useGitHubAccess, useGitHubToken, usePanelTokenFormFor } from './token';
 
-/** Why GitHub gave no answer, in one sentence, by the error and whether a token is stored. */
+/** Why GitHub gave no answer, in one sentence, by the error and how GitHub is reached. */
 export function useGitHubErrorMessage(error: unknown): string {
   const t = usePluginTranslation('pull-requests');
-  const { token } = useGitHubToken();
+  const { via } = useGitHubAccess();
   const kind = error instanceof GitHubError ? error.kind : 'failed';
   const status = error instanceof GitHubError ? error.status : 0;
   if (kind === 'failed') {
     return status === 0 ? t('error.failed') : t('error.failedStatus', { status });
   }
-  return kind === 'notFound' && token !== undefined
-    ? t('error.notFoundWithToken')
-    : t(`error.${kind}`);
+  if (kind === 'notFound' && via === 'token') return t('error.notFoundWithToken');
+  if (kind === 'notFound' && via === 'server') return t('error.notFoundWithServer');
+  if (kind === 'badToken' && via === 'server') return t('error.badConnection');
+  return t(`error.${kind}`);
 }
 
 /**
@@ -32,13 +33,20 @@ export function GitHubErrorState({
 }) {
   const t = usePluginTranslation('pull-requests');
   const { token, forget } = useGitHubToken();
+  const { via, recheck } = useGitHubAccess();
   const focusTokenForm = usePanelTokenFormFor(compact ? error : undefined);
   const message = useGitHubErrorMessage(error);
   const hasToken = token !== undefined;
   const kind = error instanceof GitHubError ? error.kind : 'failed';
   const savedTokenNotFound = kind === 'notFound' && hasToken;
   const retry = (
-    <button className="mrpr-button" type="button" onClick={onRetry}>
+    <button
+      className="mrpr-button"
+      type="button"
+      // MindRoom is asked first whether GitHub is connected there: once that changed, everything
+      // is read again with it, and this read too.
+      onClick={() => void recheck().then((changed) => (changed ? undefined : onRetry()))}
+    >
       {t('error.retry')}
     </button>
   );
@@ -65,7 +73,8 @@ export function GitHubErrorState({
       </div>
     );
   }
-  if (kind === 'rateLimited' && hasToken) {
+  // MindRoom's connection has a token's limit: another token would not raise it.
+  if (kind === 'rateLimited' && via !== undefined) {
     return (
       <p className="mrpr-status" role="alert">
         {message}
@@ -77,12 +86,20 @@ export function GitHubErrorState({
       <p className="mrpr-status" role="alert">
         {message}
       </p>
-      {kind === 'badToken' || savedTokenNotFound ? (
+      {hasToken && (kind === 'badToken' || savedTokenNotFound) ? (
         <button className="mrpr-button" type="button" onClick={forget}>
           {t('token.forget')}
         </button>
       ) : null}
-      <TokenForm reason={savedTokenNotFound ? 'badToken' : kind} />
+      <TokenForm
+        reason={
+          savedTokenNotFound
+            ? 'badToken'
+            : kind === 'badToken' && via === 'server'
+            ? 'override'
+            : kind
+        }
+      />
     </div>
   );
 }

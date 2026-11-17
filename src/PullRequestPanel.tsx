@@ -45,7 +45,15 @@ import {
 import { buildReviewThreads } from './reviewThreads';
 import { clearShownPullRequest, setShownPullRequest } from './shownPullRequest';
 import { pluginRootStyle } from './theme';
-import { PanelTokenFormContext, TokenForm, useGitHubToken, usePanelTokenForm } from './token';
+import {
+  PanelTokenFormContext,
+  GitHubConnectedNote,
+  RoomGitHub,
+  TokenForm,
+  useGitHubAccess,
+  useGitHubToken,
+  usePanelTokenForm,
+} from './token';
 
 const TABS = ['summary', 'timeline', 'code'] as const;
 type Tab = (typeof TABS)[number];
@@ -284,13 +292,17 @@ function Files({
   );
 }
 
-export default function PullRequestPanel({
-  roomId,
-  request,
-}: {
-  roomId: string;
-  request?: unknown;
-}) {
+type PanelProps = { roomId: string; request?: unknown };
+
+export default function PullRequestPanel(props: PanelProps) {
+  return (
+    <RoomGitHub roomId={props.roomId}>
+      <Panel {...props} />
+    </RoomGitHub>
+  );
+}
+
+function Panel({ roomId, request }: PanelProps) {
   const t = usePluginTranslation('pull-requests');
   const ref = useMemo(() => readRequest(request), [request]);
   // The strip under the room header marks the chip of the pull request the panel shows.
@@ -300,7 +312,16 @@ export default function PullRequestPanel({
   }, [roomId, ref]);
   const query = usePullRequest(ref);
   const { token, forget } = useGitHubToken();
+  const { via } = useGitHubAccess();
   const tokenForm = usePanelTokenForm();
+  // The token form a person opened to use a token instead of MindRoom's connection, which goes
+  // once a token is saved.
+  const [overriding, setOverriding] = useState(false);
+  const focusTokenForm = tokenForm.context.focus;
+  useEffect(() => {
+    if (via !== 'server') setOverriding(false);
+    else if (overriding) focusTokenForm();
+  }, [focusTokenForm, overriding, via]);
   const [tab, setTab] = useState<Tab>('summary');
   // The Timeline tab's order, which the tab bar's toggle sets.
   const [order, setOrder] = useState<Order>('newest');
@@ -426,13 +447,31 @@ export default function PullRequestPanel({
                 <button className="mrpr-button" type="button" onClick={forget}>
                   {t('token.forget')}
                 </button>
+              ) : via === 'server' ? (
+                <span className="mrpr-status">
+                  <GitHubConnectedNote />{' '}
+                  {tokenForm.reason || overriding ? null : (
+                    <button
+                      type="button"
+                      className="mrpr-link-button"
+                      onClick={() => setOverriding(true)}
+                    >
+                      {t('token.useToken')}
+                    </button>
+                  )}
+                </span>
               ) : null}
             </div>
           </div>
           {/* One token form for every part below that a token would let load. */}
-          {tokenForm.reason ? (
+          {tokenForm.reason || (overriding && via === 'server') ? (
             <div className="mrpr-panel-token">
-              <TokenForm reason={tokenForm.reason} inputRef={tokenForm.inputRef} />
+              <TokenForm
+                reason={tokenForm.reason ?? 'override'}
+                inputRef={tokenForm.inputRef}
+                // Only the form opened to use a token instead closes: a failure keeps the other.
+                onCancel={tokenForm.reason ? undefined : () => setOverriding(false)}
+              />
             </div>
           ) : null}
           <TabBar

@@ -6,6 +6,14 @@ import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import plugin from './index';
 import { PullRequestCard } from './PullRequestCard';
+import { githubServer } from './testing/mindroomServer';
+
+// The room has no MindRoom server unless a test gives one: the stand-in client knows no room.
+const roomServer = vi.hoisted(() => ({ current: undefined as unknown }));
+vi.mock('@mindroom/client-sdk/server', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@mindroom/client-sdk/server')>()),
+  useMindroomServerStatus: () => ({ server: roomServer.current, pending: false }),
+}));
 
 vi.mock('focus-trap-react', () => ({
   default: ({ children }: { children: ReactNode }) => children,
@@ -74,6 +82,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.unstubAllGlobals();
+  roomServer.current = undefined;
 });
 
 describe('PullRequestCard', () => {
@@ -110,6 +119,65 @@ describe('PullRequestCard', () => {
     expect(await view.findByText('Add pull request cards')).toBeTruthy();
     const init = fetchMock.mock.calls.at(-1)?.[1];
     expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer ghp_secret');
+  });
+
+  it("says MindRoom's GitHub App may not reach a repository it does not find, and takes a token", async () => {
+    const mindroom = githubServer(async () => respond({ message: 'Not Found' }, 404));
+    roomServer.current = mindroom.server;
+    const view = await show();
+    expect(
+      await view.findByText(
+        'GitHub did not find this pull request. The GitHub App connected in MindRoom may not be installed on this repository.'
+      )
+    ).toBeTruthy();
+    expect(
+      view.getByText(
+        'Using your GitHub account connected in MindRoom (@octo). A token saved here is used instead.'
+      )
+    ).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
+    // A token saved here reads from the browser, and MindRoom is asked nothing more.
+    fetchMock.mockImplementation(async () => respond(pull()));
+    const asked = mindroom.server.request.mock.calls.length;
+    await type(view.getByLabelText('GitHub token'), 'ghp_secret');
+    await click(view.getByRole('button', { name: 'Save' }));
+    expect(await view.findByText('Add pull request cards')).toBeTruthy();
+    const init = fetchMock.mock.calls.at(-1)?.[1];
+    expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer ghp_secret');
+    expect(mindroom.server.request.mock.calls.length).toBe(asked);
+  });
+
+  it('says MindRoom must connect GitHub again when GitHub refuses its account', async () => {
+    roomServer.current = githubServer(async () =>
+      respond({ message: 'Bad credentials' }, 401)
+    ).server;
+    const view = await show();
+    expect(
+      await view.findByText(
+        'GitHub refused your account connected in MindRoom. Connect GitHub again in MindRoom.'
+      )
+    ).toBeTruthy();
+    // No token to forget, but one can be saved instead.
+    expect(view.queryByRole('button', { name: 'Forget token' })).toBeNull();
+    expect(view.queryByText('Save another token to replace it.')).toBeNull();
+    expect(view.getByLabelText('GitHub token')).toBeTruthy();
+  });
+
+  it('asks MindRoom again on Try again, and reads through it once GitHub is connected', async () => {
+    const status: { connected: boolean; login?: string } = { connected: false };
+    const mindroom = githubServer(async () => respond(pull()), status);
+    roomServer.current = mindroom.server;
+    fetchMock.mockImplementation(async () => respond({}, 500));
+    const view = await show();
+    await view.findByText('GitHub answered with status 500.');
+    status.connected = true;
+    status.login = 'octo';
+    const asked = fetchMock.mock.calls.length;
+    await click(view.getByRole('button', { name: 'Try again' }));
+    expect(await view.findByText('Add pull request cards')).toBeTruthy();
+    expect(mindroom.statusRequests()).toBe(2);
+    // The read went through MindRoom, not anonymously again.
+    expect(fetchMock.mock.calls.length).toBe(asked);
   });
 
   it('shows the bad token state', async () => {

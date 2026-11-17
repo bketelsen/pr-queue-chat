@@ -8,11 +8,20 @@ import {
   useState,
   useSyncExternalStore,
   type FormEvent,
+  type ReactNode,
   type Ref,
 } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import {
+  CancelledError,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+  type QueryKey,
+} from '@tanstack/react-query';
 import { usePluginStorage, usePluginTranslation } from '@mindroom/client-sdk/core';
-import { GitHubError } from './github';
+import { useMatrixClient } from '@mindroom/client-sdk/matrix';
+import { useMindroomServerStatus, type MindroomServer } from '@mindroom/client-sdk/server';
+import { GitHubError, type GitHubAuth, type GitHubViaServer } from './github';
 
 const KEY = 'githubToken';
 
@@ -39,30 +48,26 @@ export function useGitHubToken(): {
   const storage = usePluginStorage('pull-requests');
   const queryClient = useQueryClient();
   const token = useSyncExternalStore(subscribe, () => storage.getItem(KEY)) ?? undefined;
-  const changed = useCallback(() => {
-    notify();
-    // What the old token (or none) was refused says nothing about the new one. A refusal is
-    // not asked again when its part next shows (`retryOnMount: false`), which is right only
-    // for the token that got it, so the refusals are forgotten: they are asked anew then.
-    // Only those with nothing read: what shows stays on screen while it is read again.
-    void queryClient.resetQueries({
-      queryKey: ['pull-requests'],
-      predicate: ({ state }) => state.status === 'error' && state.data === undefined,
-    });
-    // Results fetched with the old token (or none) may differ now. The queries read the stored
-    // token as they fetch, so this refetch already uses the new one.
-    void queryClient.invalidateQueries({ queryKey: ['pull-requests'] });
-  }, [queryClient]);
+  const changed = useCallback(
+    (stored: boolean) => {
+      notify();
+      // What the old token (or none) was refused says nothing about the new one, and results
+      // fetched with it may differ now. A new token keeps the token's keys, so what shows under
+      // them is read again here, with the new one.
+      readAgain(queryClient, stored ? true : undefined);
+    },
+    [queryClient]
+  );
   return useMemo(
     () => ({
       token,
       setToken: (value: string) => {
         storage.setItem(KEY, value);
-        changed();
+        changed(true);
       },
       forget: () => {
         storage.removeItem(KEY);
-        changed();
+        changed(false);
       },
     }),
     [changed, storage, token]
@@ -75,15 +80,250 @@ export function useStoredToken(): () => string | undefined {
   return useCallback(() => storage.getItem(KEY) ?? undefined, [storage]);
 }
 
+type RoomServer = { server: MindroomServer | undefined; pending: boolean };
+
+/**
+ * The room's MindRoom server, through which the parts inside may reach GitHub as the person, and
+ * whether the room does not know yet if it has one.
+ */
+export const GitHubServerContext = createContext<RoomServer>({ server: undefined, pending: false });
+
+/** Gives the parts inside the MindRoom server of the room `roomId`, when it has one. */
+export function RoomGitHub({ roomId, children }: { roomId: string; children: ReactNode }) {
+  const { server, pending } = useMindroomServerStatus(roomId);
+  const value = useMemo(() => ({ server, pending }), [server, pending]);
+  return <GitHubServerContext.Provider value={value}>{children}</GitHubServerContext.Provider>;
+}
+
+type ServerStatus = { connected: boolean; login: string | undefined };
+
+// Not under `pull-requests`, whose queries a new token asks again: the status is the server's.
+const statusKey = (origin: string) => ['pull-requests-github-status', origin] as const;
+
+// The connection changes when the person connects or disconnects GitHub in MindRoom, rarely. One
+// that is not there is asked again sooner, on focus, so that connecting shows soon; never at once,
+// so that a server whose status and requests disagree cannot keep the parts switching.
+const statusStaleTime = (status: ServerStatus | undefined) =>
+  status?.connected ? 300_000 : 30_000;
+
+/** Which connection a status names, for telling when it changed. */
+const identity = (status: ServerStatus) =>
+  status.connected ? `connected:${status.login ?? ''}` : 'none';
+
+/** How GitHub is reached in a key of `queries.ts`, after the pull request or the repository. */
+const accessOf = (queryKey: QueryKey) => queryKey[queryKey[1] === 'repo' ? 4 : 5];
+
+const serverKey = (origin: string, login: string | undefined) =>
+  `server:${origin}:${login ?? 'unknown'}`;
+
+/**
+ * The parts reach GitHub as another account now, or as none. Nothing is read again here under the
+ * keys they leave: a read there would go with the new access (or be cancelled, `authFor`), and the
+ * parts read under their new keys themselves. What was read stays, stale, for its own access; the
+ * part that shows it next reads it again. A refusal is not asked again when its part next shows
+ * (`retryOnMount: false`), so the refusals with nothing read that no part shows are forgotten:
+ * they are asked anew then. One a part shows is asked again once that part shows it anew, under a
+ * key it changes to. `refetch`, the key the parts keep (a new token's), is read again where it
+ * shows.
+ */
+function readAgain(queryClient: QueryClient, refetch?: AccessKey) {
+  const queryKey = ['pull-requests'];
+  queryClient
+    .getQueryCache()
+    .findAll({
+      queryKey,
+      type: 'inactive',
+      predicate: ({ state }) => state.status === 'error' && state.data === undefined,
+    })
+    .forEach((query) => query.reset());
+  void queryClient.invalidateQueries({ queryKey, refetchType: 'none' });
+  if (refetch === undefined) return;
+  void queryClient.refetchQueries({
+    queryKey,
+    type: 'active',
+    predicate: (query) => accessOf(query.queryKey) === refetch,
+  });
+}
+
+/** Keeps `status` as the server's, and reads everything again when it names another connection. */
+function setStatus(queryClient: QueryClient, origin: string, status: ServerStatus) {
+  const before = queryClient.getQueryData<ServerStatus>(statusKey(origin));
+  queryClient.setQueryData(statusKey(origin), status);
+  if (before && identity(before) !== identity(status)) readAgain(queryClient);
+}
+
+async function readStatus(server: MindroomServer): Promise<ServerStatus> {
+  const answer: unknown = await server.request('/api/github/status');
+  const status = typeof answer === 'object' && answer !== null ? (answer as ServerStatus) : null;
+  const login = status?.login;
+  return {
+    connected: status?.connected === true,
+    login: typeof login === 'string' && login !== '' ? login : undefined,
+  };
+}
+
+/**
+ * Requests through `server` as the person's connected GitHub account, `account` the signed-in
+ * account and the login. Once the server says that connection is gone, the parts read without it,
+ * and the status is asked again once it is stale.
+ */
+function viaServer(
+  queryClient: QueryClient,
+  server: MindroomServer,
+  account: string
+): GitHubViaServer {
+  return {
+    server,
+    account,
+    disconnected: () =>
+      setStatus(queryClient, server.origin, { connected: false, login: undefined }),
+  };
+}
+
+/** What the query keys carry of how GitHub is reached, as `GitHubAccess.key`. */
+export type AccessKey = boolean | string;
+
+/** How the parts reach GitHub now, as `useGitHubAccess` gives it. */
+export type GitHubAccess = {
+  /** With the token stored in the browser, through MindRoom, or neither (anonymous, no writes). */
+  via: 'token' | 'server' | undefined;
+  /** The GitHub login connected in MindRoom, when the server named it. */
+  login: string | undefined;
+  /**
+   * What the query keys carry of it, never a token: false without either, true with the token,
+   * `server:<origin>:<login>` through MindRoom (`unknown` for a login the server did not name),
+   * so no two of them share what was read.
+   */
+  key: AccessKey;
+  /**
+   * While the room does not know its server yet, or the server has not said whether GitHub is
+   * connected there, with no token stored; nothing should read yet.
+   */
+  pending: boolean;
+  /**
+   * How a request that starts now goes, and the key that names it, for one that runs after the
+   * render that started it, as a write does.
+   */
+  current(): { key: AccessKey; auth: GitHubAuth | undefined };
+  /**
+   * How a read under `key` goes, which is the access the key names and never another: without one
+   * for `false`; else the access now, when that is still the one `key` names. When it is not, the
+   * read throws `CancelledError`, which leaves what was read under `key` as it was; the parts
+   * read under their new key.
+   */
+  authFor(key: AccessKey): GitHubAuth | undefined;
+  /**
+   * Asks the server again whether GitHub is connected there, as a part's Try again does; resolves
+   * to whether the parts read again by themselves now, under the keys of another connection: one
+   * that differs from the one before, or the first connected one when none was known.
+   */
+  recheck(): Promise<boolean>;
+};
+
+/** Whose GitHub account the requests through MindRoom use, while they go that way. */
+export function GitHubConnectedNote() {
+  const t = usePluginTranslation('pull-requests');
+  const { via, login } = useGitHubAccess();
+  if (via !== 'server') return null;
+  return <>{login ? t('token.connected', { login }) : t('token.connectedNoLogin')}</>;
+}
+
+/**
+ * How to reach GitHub: the token stored in the browser comes first; else, while the room's
+ * MindRoom server says the person's GitHub account is connected there, through that server;
+ * else anonymously. The server is asked once for the status, and not while a token is stored.
+ */
+export function useGitHubAccess(): GitHubAccess {
+  const { token } = useGitHubToken();
+  const storedToken = useStoredToken();
+  const { server, pending: serverPending } = useContext(GitHubServerContext);
+  const userId = useMatrixClient().getSafeUserId();
+  const queryClient = useQueryClient();
+  const origin = server?.origin ?? '';
+  const status = useQuery({
+    queryKey: statusKey(origin),
+    queryFn: async () => {
+      const now = await readStatus(server as MindroomServer);
+      setStatus(queryClient, origin, now);
+      return now;
+    },
+    enabled: server !== undefined && token === undefined,
+    staleTime: statusStaleTime(queryClient.getQueryData<ServerStatus>(statusKey(origin))),
+    retry: false,
+    retryOnMount: false,
+  });
+  const connected = server !== undefined && token === undefined && status.data?.connected === true;
+  const login = connected ? status.data?.login : undefined;
+  const current = useCallback((): { key: AccessKey; auth: GitHubAuth | undefined } => {
+    const stored = storedToken();
+    if (stored !== undefined) return { key: true, auth: stored };
+    const now = server && queryClient.getQueryData<ServerStatus>(statusKey(server.origin));
+    if (!server || !now?.connected) return { key: false, auth: undefined };
+    return {
+      key: serverKey(server.origin, now.login),
+      auth: viaServer(queryClient, server, `${userId} ${now.login ?? ''}`),
+    };
+  }, [queryClient, server, storedToken, userId]);
+  const authFor = useCallback(
+    (key: AccessKey): GitHubAuth | undefined => {
+      // Anonymous is always at hand, also in a room that reads otherwise now and shares the key.
+      if (key === false) return undefined;
+      const now = current();
+      if (now.key !== key) throw new CancelledError({ revert: true });
+      return now.auth;
+    },
+    [current]
+  );
+  const recheck = useCallback(async () => {
+    if (!server || storedToken() !== undefined) return false;
+    const key = statusKey(server.origin);
+    const before = queryClient.getQueryData<ServerStatus>(key);
+    await queryClient.invalidateQueries({ queryKey: key });
+    const now = queryClient.getQueryData<ServerStatus>(key);
+    if (now === undefined) return false;
+    // A first status after a failed one reads everything again only when it is connected,
+    // through the new keys; one that is not leaves the reading again to the caller.
+    return before === undefined ? now.connected : identity(before) !== identity(now);
+  }, [queryClient, server, storedToken]);
+  return useMemo(
+    () => ({
+      via: token !== undefined ? 'token' : connected ? 'server' : undefined,
+      login,
+      key: token !== undefined ? true : connected ? serverKey(origin, login) : false,
+      pending: token === undefined && (serverPending || (server !== undefined && status.isPending)),
+      current,
+      authFor,
+      recheck,
+    }),
+    [
+      authFor,
+      connected,
+      current,
+      login,
+      origin,
+      recheck,
+      server,
+      serverPending,
+      status.isPending,
+      token,
+    ]
+  );
+}
+
 export function TokenForm({
   reason,
   inputRef,
+  onCancel,
 }: {
-  reason: 'notFound' | 'rateLimited' | 'badToken';
+  /** Why it shows; `override`, to use a token instead of MindRoom's connection, has no hint. */
+  reason: 'notFound' | 'rateLimited' | 'badToken' | 'override';
   inputRef?: Ref<HTMLInputElement>;
+  /** Closes the form without saving, for one the person opened; without it, none shows. */
+  onCancel?: () => void;
 }) {
   const t = usePluginTranslation('pull-requests');
   const { setToken } = useGitHubToken();
+  const { via } = useGitHubAccess();
   const [value, setValue] = useState('');
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -94,7 +334,12 @@ export function TokenForm({
   };
   return (
     <form className="mrpr-token" onSubmit={submit}>
-      <p className="mrpr-status">{t(`token.hint.${reason}`)}</p>
+      {via === 'server' ? (
+        <p className="mrpr-status">
+          <GitHubConnectedNote /> {t('token.overrides')}
+        </p>
+      ) : null}
+      {reason === 'override' ? null : <p className="mrpr-status">{t(`token.hint.${reason}`)}</p>}
       <div className="mrpr-token-row">
         <input
           ref={inputRef}
@@ -108,6 +353,11 @@ export function TokenForm({
         <button className="mrpr-button" type="submit">
           {t('token.save')}
         </button>
+        {onCancel ? (
+          <button className="mrpr-button" type="button" onClick={onCancel}>
+            {t('token.cancel')}
+          </button>
+        ) : null}
       </div>
       <p className="mrpr-status">{t('token.note')}</p>
     </form>
@@ -160,10 +410,14 @@ export function usePanelTokenForm() {
  */
 export function usePanelTokenFormFor(error: unknown): (() => void) | undefined {
   const form = useContext(PanelTokenFormContext);
-  const { token } = useGitHubToken();
+  const { via } = useGitHubAccess();
   const kind = error instanceof GitHubError ? error.kind : undefined;
+  // A token overrides MindRoom's connection where that cannot read the repository, but has the
+  // same rate limit.
   const reason =
-    token === undefined && (kind === 'notFound' || kind === 'rateLimited') ? kind : undefined;
+    via !== 'token' && (kind === 'notFound' || (kind === 'rateLimited' && via === undefined))
+      ? kind
+      : undefined;
   useEffect(() => (form && reason ? form.need(reason) : undefined), [form, reason]);
   return form && reason ? form.focus : undefined;
 }
