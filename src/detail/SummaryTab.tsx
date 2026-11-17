@@ -16,15 +16,13 @@ import type { RectCords } from 'folds';
 import { ArrowDownUp, ChevronRight, ListFilter, Tag, Users } from 'lucide-react';
 import { usePluginStorage, usePluginTranslation } from '@mindroom/client-sdk/core';
 import { Menu, PopOut, useMarkdownHtml } from '@mindroom/client-sdk/ui';
-import type { Actor, Paged, PullRequest, PullRequestRef, Review } from '../github';
+import type { Paged, PullRequest, PullRequestRef, Review } from '../github';
 import { GitHubErrorState } from '../GitHubErrorState';
 import {
-  PullRequestActorAvatar,
   PullRequestCheckStatusIcon,
   PullRequestCheckStatusLabel,
   PullRequestLabelChip,
-  PullRequestReviewOutcomeAvatarBadge,
-  pullRequestReviewOutcomeRingClassName,
+  PullRequestReviewerAvatar,
   usePullRequestReviewOutcomeLabel,
 } from '../presentation';
 import { useChecks, useConversationComments, useReviewComments, useReviews } from '../queries';
@@ -36,9 +34,9 @@ import { TruncatedNote } from './TruncatedNote';
 import {
   conversationItems,
   filterConversationItems,
+  joinReviewers,
   latestReviewOutcomes,
   type ConversationItem,
-  type Outcome,
 } from './detail.logic';
 
 const PAGE = 10;
@@ -110,16 +108,6 @@ function MetaRow({
   );
 }
 
-type Reviewer = {
-  key: string;
-  actor: Actor | null;
-  outcome: Outcome | null;
-  stale: boolean;
-};
-
-// GitHub's login casing varies between its lists.
-const reviewerKey = (login: string) => login.toLowerCase();
-
 /** The reviewers' avatars: those asked and those who gave a verdict, a ring and a glyph for each verdict. */
 function ReviewersRow({
   pullRequest,
@@ -138,37 +126,7 @@ function ReviewersRow({
     () => (reviews ? latestReviewOutcomes(reviews.items, pullRequest.headSha) : []),
     [reviews, pullRequest.headSha]
   );
-  const byLogin = new Map(
-    outcomes.flatMap((entry) =>
-      entry.actor ? [[reviewerKey(entry.actor.login), entry] as const] : []
-    )
-  );
-  // GitHub drops a reviewer from the requested ones once they review, so the verdicts of others join.
-  const entries: Reviewer[] = [
-    ...pullRequest.requestedReviewers.map((actor) => {
-      const entry = byLogin.get(reviewerKey(actor.login));
-      return {
-        key: actor.login,
-        actor,
-        outcome: entry?.verdict ?? null,
-        stale: entry?.stale ?? false,
-      };
-    }),
-    ...outcomes
-      .filter(
-        (entry) =>
-          !entry.actor ||
-          !pullRequest.requestedReviewers.some(
-            (actor) => reviewerKey(actor.login) === reviewerKey(entry.actor?.login ?? '')
-          )
-      )
-      .map((entry) => ({
-        key: entry.login,
-        actor: entry.actor,
-        outcome: entry.verdict,
-        stale: entry.stale,
-      })),
-  ];
+  const entries = joinReviewers(outcomes, pullRequest.requestedReviewers);
   const nothing = entries.length === 0 && pullRequest.requestedTeams.length === 0;
   return (
     <MetaRow icon={<Users aria-hidden className="mrpr-icon" />} label={t('summary.reviewers')}>
@@ -187,27 +145,11 @@ function ReviewersRow({
                   : login;
               const label = entry.outcome ? outcomeLabel(entry.outcome, entry.stale) : null;
               return (
-                <span
+                <PullRequestReviewerAvatar
                   key={entry.key}
-                  className={`mrpr-reviewer${
-                    entry.outcome
-                      ? ` ${pullRequestReviewOutcomeRingClassName(entry.outcome, entry.stale)}`
-                      : ''
-                  }`}
+                  reviewer={entry}
                   title={label ? t('summary.reviewerTitle', { name, outcome: label }) : name}
-                >
-                  <PullRequestActorAvatar actor={entry.actor} />
-                  <span className="mrpr-sr-only">{login}</span>
-                  {entry.outcome ? (
-                    <>
-                      <PullRequestReviewOutcomeAvatarBadge
-                        outcome={entry.outcome}
-                        stale={entry.stale}
-                      />
-                      <span className="mrpr-sr-only">{label}</span>
-                    </>
-                  ) : null}
-                </span>
+                />
               );
             })}
           </span>

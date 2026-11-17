@@ -9,6 +9,8 @@ A [MindRoom Chat](https://github.com/mindroom-ai/mindroom-chat) client plugin fo
 - Timeline: the opening, each commit, each verdict, the review threads, the comments and the merge or close, in time order; choosing a commit shows its diff in the Code tab.
 - Code: the changed files as a tree beside their diffs, in T3 Code's file order, with the review threads at their lines (and those not on the diff above it), a commit selector, viewed marks kept in the browser, and controls to hide test files and whitespace changes, show the diffs split or stacked, wrap lines, and collapse or expand all files.
 
+A pull request's state has GitHub's colors, the same in every theme, wherever it shows: green for open, purple for merged, red for closed and gray for a draft.
+
 The card and most of the panel are ported from [T3 Code](https://github.com/pingdotgg/t3code) (MIT, see [NOTICE](NOTICE)); each ported file names its T3 Code source in its first line.
 
 ## Pull requests of a thread
@@ -23,6 +25,20 @@ A linked pull request shows as a chip: its state's icon, its number and, while a
 
 - On a thread's card in the Compact view: the chips of the first two pull requests linked to it (one on a phone), then `+N` for the rest. A click on a chip opens the thread and the pull request in the side panel; elsewhere on the card, the click opens the thread as before. These chips take no focus, since the card is one button.
 - Under the room header, while a thread is open: a chip for each of its pull requests, as a button that opens the pull request in the side panel. While the panel is open, the chip of the pull request it shows is pressed.
+
+A pointer that rests on a chip for 150 ms, on a card or in the strip, opens a card with the pull request at a glance; a chip in the strip also opens it when the keyboard focuses it. It opens only where the pointer can hover finely (`(hover: hover) and (pointer: fine)`, a mouse or a trackpad): on a touch screen, a tap on a chip does what it did before. The card shows:
+
+- the repository and the number, the state, and the Auto-merge badge
+- the title, in three lines at most
+- the author, when the pull request was opened, and when it was updated, merged or closed
+- the head and base branches, with a warning when the branch conflicts with its base or is behind it
+- the lines, files, commits and comments
+- the checks' summary, when the chip shows their mark (an open pull request, with a token)
+- each reviewer's latest verdict, and the reviewers and teams still asked for a review, in one line: an avatar with the verdict on its corner as in the panel, six at most and the count of the rest, with a token
+- the first five labels, each cut to one short line, and the count of the rest
+- a note that a click opens the pull request in the side panel, when it does
+
+Until GitHub sent the pull request, the card shows the repository, the number and that it loads; when GitHub refused, why. It only reads: it takes no pointer and no focus, and closes when the pointer leaves, on a click and on Escape. It opens below the chip, or above it when the chip is in the lower half of the window, and stays inside the window as its content arrives.
 
 A thread's agent can also work in a git worktree, in its workspace or outside it. MindRoom's backend plugin `thread-worktree` records it in the room's state, one state event per thread, which this plugin only reads:
 
@@ -80,13 +96,13 @@ The end-to-end spec `e2e/threadPullRequests.spec.ts` runs in the client's Playwr
 E2E_PLUGIN_DIRS=/path/to/pull-request-client-plugin MINDROOM_CLIENT_PLUGINS=/path/to/pull-request-client-plugin just e2e-slot 3 --preview npx playwright test --project=pull-request-client-plugin
 ```
 
-The page answers GitHub's API itself, so no request leaves the test. With `MRPR_SHOTS=<directory>` (an absolute one: the run's working directory is the slot's snapshot), it saves screenshots of a thread's pull requests: the Compact view in the light and dark themes, an open thread with its strip and the panel, and the Compact view on a phone; and of a thread's branch on its card and in the strip of the open thread.
+The page answers GitHub's API itself, so no request leaves the test. With `MRPR_SHOTS=<directory>` (an absolute one: the run's working directory is the slot's snapshot), it saves screenshots of a thread's pull requests: the Compact view in the light and dark themes, the hover card of a chip on a card and of one in the strip in both themes, a hover card with six reviewers and five labels, an open thread with its strip and the panel, and the Compact view on a phone; and of a thread's branch on its card and in the strip of the open thread.
 
 ## GitHub token
 
 Public pull requests need no token. For a private repository, or to avoid GitHub's rate limit for requests without one, a person can enter a GitHub token in the plugin's panel. The token is kept in the browser's localStorage for the signed-in account, where any script running on the page can read it. Requests go to `https://api.github.com` and nowhere else; the token is sent only there, and only when one is stored. The plugin only reads (`GET`).
 
-The chips of a thread's pull requests ask GitHub for each pull request once it has been on screen: one request each, and two more for its checks when a token is stored. A chip asks again when it shows after its answer is more than two minutes old, and not when the tab regains focus. Without a token, GitHub allows 60 requests an hour for the address, shared with the panel, and the chips show no checks marks. After GitHub answers with its rate limit, the plugin asks it nothing more until the limit resets.
+The chips of a thread's pull requests ask GitHub for each pull request once it has been on screen: one request each, and two more for its checks when a token is stored. With a token, a chip's hover card asks for the reviews when it opens, usually one request (one per 100 reviews), and uses that answer for two minutes; a chip that is only on screen asks for none, and without a token the card asks for no reviews and shows none. A chip asks again when it shows after its answer is more than two minutes old, and not when the tab regains focus. Without a token, GitHub allows 60 requests an hour for the address, shared with the panel, and the chips show no checks marks. After GitHub answers with its rate limit, the plugin asks it nothing more until the limit resets.
 
 Use a fine-grained token with read-only access to these permissions of the repositories, as GitHub's [permissions required for fine-grained personal access tokens](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens) lists them for the endpoints the plugin calls (every fine-grained token also has Metadata: read):
 
