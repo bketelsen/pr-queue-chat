@@ -61,11 +61,96 @@ export const en = {
   tab: { summary: 'Summary', timeline: 'Timeline', code: 'Code' },
   copyCheckout: 'Copy checkout command',
   badge: { autoMerge: 'Auto-merge ({{method}})' },
+  // The header's actions on a pull request: its primary control, the menu, the delete dialog
+  // and the line under the header that says what runs and what failed. `pending`, `failed` and
+  // `done` are by action; a screen reader hears each, also those the line does not show.
+  actions: {
+    merge: { merge: 'Merge', squash: 'Squash and merge', rebase: 'Rebase and merge' },
+    autoMerge: 'Auto-merge ({{method}})',
+    ready: 'Ready for review',
+    confirm: {
+      merge: 'Confirm merge?',
+      autoMerge: 'Confirm auto-merge?',
+      close: 'Confirm close?',
+    },
+    pending: {
+      merge: 'Merging...',
+      'enable-auto-merge': 'Enabling...',
+      'disable-auto-merge': 'Disabling...',
+      ready: 'Marking ready for review...',
+      draft: 'Converting to draft...',
+      close: 'Closing...',
+      reopen: 'Reopening...',
+      'update-branch': 'Updating branch...',
+      'update-branch-rebase': 'Rebasing branch...',
+      'delete-branch': 'Deleting branch...',
+    },
+    conflicts: 'Conflicts',
+    more: 'More actions',
+    methodGroup: 'Merge method',
+    mergeNow: 'Merge now',
+    enableAutoMerge: 'Enable auto-merge',
+    disableAutoMerge: 'Disable auto-merge',
+    draft: 'Convert to draft',
+    close: 'Close pull request',
+    reopen: 'Reopen pull request',
+    deleteBranch: 'Delete branch',
+    refresh: 'Refresh',
+    deleteTitle: 'Delete branch {{branch}}?',
+    deleteBody:
+      'This deletes {{branch}} from {{repo}} on GitHub. Local branches and worktrees are not changed.',
+    cancel: 'Cancel',
+    done: {
+      merge: 'Pull request merged',
+      'enable-auto-merge': 'Auto-merge enabled',
+      'disable-auto-merge': 'Auto-merge disabled',
+      ready: 'Marked ready for review',
+      draft: 'Converted to draft',
+      close: 'Pull request closed',
+      reopen: 'Pull request reopened',
+      'delete-branch': 'Branch deleted',
+      'update-branch': 'Branch updated',
+      'update-branch-rebase': 'Branch rebased',
+    },
+    // GitHub took the update, but answered before the branch had its new commit.
+    requested: {
+      'update-branch': 'Branch update requested',
+      'update-branch-rebase': 'Branch rebase requested',
+    },
+    failed: {
+      merge: 'Could not merge this pull request',
+      'enable-auto-merge': 'Could not turn on auto-merge',
+      'disable-auto-merge': 'Could not turn off auto-merge',
+      ready: 'Could not mark this ready for review',
+      draft: 'Could not convert this to a draft',
+      close: 'Could not close this pull request',
+      reopen: 'Could not reopen this pull request',
+      'update-branch': 'Could not update this branch',
+      'update-branch-rebase': 'Could not rebase this branch',
+      'delete-branch': 'Could not delete this branch',
+    },
+    // Why, by the failure's kind; a refusal shows GitHub's own reason instead, and the others
+    // (but a refused token) show it after the hint. `failed` is a request GitHub never
+    // answered, `server` one it answered with an error of its own.
+    hint: {
+      noAccess:
+        'GitHub refused it. The saved token may not have write access to this repository (Pull requests and Contents: Read and write).',
+      badToken: 'GitHub refused the saved token.',
+      rateLimited: "GitHub's rate limit is used up for now. Try again later.",
+      server: 'GitHub answered with an error.',
+      branchMoved: 'The branch has new commits since this pull request, so it was not deleted.',
+      pullRequestOpen: 'This pull request is open again, so its branch was not deleted.',
+      failed: 'Could not reach GitHub.',
+    },
+    dismiss: 'Dismiss',
+  },
   base: {
     warning: 'Warnings for {{base}}',
     behind_one: '{{head}} is {{count}} commit behind {{base}}',
     behind_other: '{{head}} is {{count}} commits behind {{base}}',
     conflicts: 'This branch has conflicts that must be resolved',
+    update: 'Update branch',
+    updateRebase: 'Update with rebase',
   },
   breakdown: {
     label: 'Lines changed: +{{additions}} -{{deletions}}',

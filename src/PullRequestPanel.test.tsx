@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PullRequestRef } from './github';
 import plugin from './index';
 import PullRequestPanel from './PullRequestPanel';
+import { resetPullRequestActions } from './actions/usePullRequestActions';
 import { useShownPullRequest } from './shownPullRequest';
 
 // The Code tab's diff libraries need a browser; the tab stands in as its file paths, what it was
@@ -125,6 +126,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
 });
 afterEach(() => {
+  resetPullRequestActions();
   vi.unstubAllGlobals();
 });
 
@@ -766,5 +768,133 @@ describe('PullRequestPanel', () => {
       expect(view.getByText('Add pull request cards')).toBeTruthy();
       expect(view.getByRole('button', { name: 'Retry' })).toBeTruthy();
     });
+  });
+
+  describe('header actions', () => {
+    const GRAPHQL = 'https://api.github.com/graphql';
+    const headerRow = (view: Awaited<ReturnType<typeof show>>) =>
+      view.container.querySelector<HTMLElement>('.mrpr-header-actions');
+
+    it("shows today's header row without a token, and asks GitHub no GraphQL", async () => {
+      const view = await show();
+      await view.findByText('Add pull request cards');
+      const row = headerRow(view);
+      expect(Array.from(row?.children ?? []).map((child) => child.textContent)).toEqual([
+        'Open on GitHub',
+      ]);
+      expect(view.queryByRole('button', { name: 'More actions' })).toBeNull();
+      expect(view.queryByRole('button', { name: 'Merge' })).toBeNull();
+      expect(fetchMock.mock.calls.filter(([url]) => url === GRAPHQL)).toEqual([]);
+    });
+
+    it('a merged pull request shows the Merged badge and no Merge button', async () => {
+      localStorage.setItem(
+        'mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/githubToken',
+        'tok'
+      );
+      const repository = {
+        viewerPermission: 'WRITE',
+        mergeCommitAllowed: true,
+        squashMergeAllowed: true,
+        rebaseMergeAllowed: true,
+        autoMergeAllowed: true,
+        defaultBranchRef: { name: 'main' },
+      };
+      fetchMock.mockImplementation(async (url) =>
+        url === GRAPHQL
+          ? respond({ data: { repository } })
+          : url.includes('/files')
+          ? respond([])
+          : respond(pull({ state: 'closed', merged_at: '2026-11-02T00:00:00Z' }))
+      );
+      const view = await show();
+      expect(await view.findByRole('button', { name: 'More actions' })).toBeTruthy();
+      expect(view.getAllByText('Merged')).toHaveLength(1);
+      expect(view.queryByRole('button', { name: 'Merge' })).toBeNull();
+      expect(headerRow(view)?.textContent).toContain('Open on GitHub');
+    });
+
+    // As T3 Code: only a branch GitHub found mergeable, not one it is still computing (null).
+    it.each([
+      ['WRITE', true, true],
+      ['READ', true, false],
+      ['WRITE', null, false],
+      ['WRITE', false, false],
+    ] as const)(
+      'the base warning offers the update with %s permission and mergeable %s: %s',
+      async (viewerPermission, mergeable, offered) => {
+        localStorage.setItem(
+          'mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/githubToken',
+          'tok'
+        );
+        const repository = {
+          viewerPermission,
+          mergeCommitAllowed: true,
+          squashMergeAllowed: false,
+          rebaseMergeAllowed: false,
+          autoMergeAllowed: false,
+          defaultBranchRef: { name: 'main' },
+        };
+        const head = {
+          ref: 'feature',
+          sha: 'abc123',
+          repo: { full_name: 'mindroom-ai/mindroom-chat' },
+        };
+        const base = { ref: 'main', repo: { full_name: 'mindroom-ai/mindroom-chat' } };
+        // GitHub updates the branch, after which the pull request has a new head, level with main.
+        let updated = false;
+        fetchMock.mockImplementation(async (url, init) => {
+          if (url === GRAPHQL && String(init?.body).includes('updatePullRequestBranch')) {
+            updated = true;
+            return respond({
+              data: { updatePullRequestBranch: { pullRequest: { headRefOid: 'def456' } } },
+            });
+          }
+          if (url === GRAPHQL) return respond({ data: { repository } });
+          if (url.includes('/compare/')) return respond({ behind_by: updated ? 0 : 2 });
+          if (url.includes('/check-runs')) return respond({ check_runs: [] });
+          if (url.includes('/status?')) return respond({ statuses: [] });
+          if (url.includes('/files') || url.includes('/commits') || url.includes('/comments'))
+            return respond([]);
+          if (url.includes('/reviews')) return respond([]);
+          return respond(
+            pull({
+              node_id: 'PR_kw200',
+              head: updated ? { ...head, sha: 'def456' } : head,
+              base,
+              mergeable,
+            })
+          );
+        });
+        const view = await show();
+        await waitUntil(() =>
+          expect(fetchMock.mock.calls.some(([url]) => url === GRAPHQL)).toBe(true)
+        );
+        await click(await view.findByRole('button', { name: 'Warnings for main' }));
+        expect(await view.findByText('feature is 2 commits behind main')).toBeTruthy();
+        if (!offered) {
+          // The repository answered, and still no update shows.
+          await act(async () => {});
+          expect(view.queryByRole('button', { name: 'Update branch' })).toBeNull();
+          return;
+        }
+        await click(await view.findByRole('button', { name: 'Update branch' }));
+        expect(await view.findByText('Branch updated')).toBeTruthy();
+        const updates = fetchMock.mock.calls.filter(([, init]) =>
+          String(init?.body).includes('updatePullRequestBranch')
+        );
+        expect(updates).toHaveLength(1);
+        expect(JSON.parse(String(updates[0][1]?.body)).variables).toEqual({
+          pullRequestId: 'PR_kw200',
+          expectedHeadOid: 'abc123',
+          updateMethod: 'MERGE',
+        });
+        // The panel has the new head, so the warning is gone.
+        await waitUntil(() =>
+          expect(view.queryByRole('button', { name: 'Warnings for main' })).toBeNull()
+        );
+        expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toEqual([]);
+      }
+    );
   });
 });

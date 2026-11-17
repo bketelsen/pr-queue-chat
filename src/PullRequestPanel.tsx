@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import { usePluginTranslation } from '@mindroom/client-sdk/core';
 import { IconButton, IconTooltip } from '@mindroom/client-sdk/ui';
+import { HeaderActions } from './actions/HeaderActions';
+import { usePullRequestActions } from './actions/usePullRequestActions';
 import { CodeTab, type ListState } from './CodeTab';
 import { BaseBranch } from './detail/BaseBranch';
 import { ChangeBreakdownStat } from './detail/ChangeBreakdownStat';
@@ -313,6 +315,8 @@ export default function PullRequestPanel({
   const selectCommit = (sha: string | undefined) => setCommitScope({ pullRequestKey, sha });
   const pr = query.data;
   const state = pr && resolvePullRequestState(pr);
+  // One runner for every control that changes the pull request, so one action runs at a time.
+  const actions = usePullRequestActions(ref, pr);
   // A branch is out of date only while the pull request can still merge.
   const behind = useBehindBy(ref, pr?.baseRef ?? '', pr?.headSha ?? '', pr?.state === 'open');
   const freshness =
@@ -380,7 +384,19 @@ export default function PullRequestPanel({
             </div>
             <div className="mrpr-branches">
               <span className="mrpr-refs">
-                <BaseBranch baseBranch={pr.baseRef} headBranch={pr.headRef} freshness={freshness} />
+                <BaseBranch
+                  baseBranch={pr.baseRef}
+                  headBranch={pr.headRef}
+                  freshness={freshness}
+                  // As T3 Code: an update only for a branch GitHub found mergeable, not while it
+                  // still computes that (null) nor for one that conflicts.
+                  onUpdate={
+                    actions.repo?.canWrite && pr.mergeable === true
+                      ? (action) => actions.perform(action)
+                      : undefined
+                  }
+                  updating={actions.pending !== null}
+                />
                 <ArrowLeft
                   aria-label={t('receivesChanges')}
                   className="mrpr-arrow mrpr-arrow-back"
@@ -402,6 +418,7 @@ export default function PullRequestPanel({
               </span>
             </div>
             <div className="mrpr-header-actions">
+              <HeaderActions pullRequestRef={ref} pullRequest={pr} actions={actions} />
               <a className="mrpr-link" href={pr.url} target="_blank" rel="noopener noreferrer">
                 {t('openOnGitHub')}
               </a>

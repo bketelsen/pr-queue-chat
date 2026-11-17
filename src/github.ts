@@ -1,4 +1,5 @@
-// GitHub's REST API for one pull request and its files, the only network this plugin uses.
+// GitHub's REST API for one pull request and its files, and the writes that change its state, the
+// only network this plugin uses.
 // It must stay free of the diff libraries: this module loads with the plugin's entry, and
 // those load only with the side panel.
 import { imageSources, type ImageSources } from './images';
@@ -24,10 +25,16 @@ export type PullRequest = {
   labels: { name: string; color: string }[];
   requestedReviewers: Actor[];
   requestedTeams: string[];
+  /** The GraphQL id, which the writes GitHub offers only there take. */
+  nodeId: string;
+  /** Null while GitHub has not computed it yet. */
+  mergeable: boolean | null;
   mergeableState: string | null;
   autoMerge: { method: 'merge' | 'squash' | 'rebase' } | null;
   headSha: string;
   headRepo: string | null;
+  /** The head repository's GraphQL id, which reading and deleting its branch take; '' without one. */
+  headRepoId: string;
   baseRepo: string;
   mergedAt: string | null;
   closedAt: string | null;
@@ -137,7 +144,11 @@ async function getJson(
   if (token) headers.Authorization = `Bearer ${token}`;
   let response: Response;
   try {
-    response = await fetch(`${API}${path}`, { headers, signal });
+    // GitHub allows a minute of caching, so a read just after a write could show the state from
+    // before it. With a token the browser revalidates by ETag, and an authorized 304 costs no rate
+    // limit. Without one a 304 still counts, and no write can have happened, so the cache serves.
+    const cache: RequestCache = token ? 'no-cache' : 'default';
+    response = await fetch(`${API}${path}`, { headers, signal, cache });
   } catch (error) {
     // An aborted request is the caller's own doing, not a failure of GitHub.
     if (signal?.aborted) throw error;
@@ -155,6 +166,114 @@ async function getJson(
   } catch {
     throw new GitHubError('failed', response.status);
   }
+}
+
+// `branchMoved` and `pullRequestOpen` are this module's own refusals to delete a branch: it got
+// commits since its pull request, or its pull request was opened again, so it is left alone.
+// `failed` with status 0 is a request GitHub never answered; with another status, an answer
+// that is none of the rest, a server error among them.
+export type GitHubWriteErrorKind =
+  | 'noAccess'
+  | 'refused'
+  | 'badToken'
+  | 'rateLimited'
+  | 'branchMoved'
+  | 'pullRequestOpen'
+  | 'failed';
+
+/** A write GitHub refused or did not take, with GitHub's own reason in `detail` when it gave one. */
+export class GitHubWriteError extends Error {
+  constructor(
+    readonly kind: GitHubWriteErrorKind,
+    readonly status: number,
+    readonly detail: string | null = null
+  ) {
+    super(`GitHub write failed: ${kind} (${status})`);
+    this.name = 'GitHubWriteError';
+  }
+}
+
+function writeErrorKind(response: Response): GitHubWriteErrorKind {
+  const { status, headers } = response;
+  if (status === 401) return 'badToken';
+  // GitHub's limits answer 429, or 403 with no requests left or with a time to retry after.
+  const limited = headers.get('x-ratelimit-remaining') === '0' || headers.has('retry-after');
+  if (status === 429 || (status === 403 && limited)) return 'rateLimited';
+  // A token without write access to the repository gets these, not a 401.
+  if (status === 403 || status === 404) return 'noAccess';
+  if (status === 405 || status === 409 || status === 422) return 'refused';
+  return 'failed';
+}
+
+// GitHub's reasons do not echo the token, but a detail is shown, so one that did is dropped.
+function reason(value: unknown, token: string): string | null {
+  return typeof value === 'string' && !value.includes(token) ? value : null;
+}
+
+/**
+ * A write to GitHub's REST API, with GitHub's answer when it sent one. Writes do not go through
+ * the read rate limit: a refusal is GitHub's answer to this write, and the reads keep their own.
+ */
+async function sendRest(
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  path: string,
+  body: unknown,
+  token: string,
+  signal?: AbortSignal
+): Promise<unknown> {
+  const headers: Record<string, string> = {
+    Accept: JSON_MEDIA,
+    'X-GitHub-Api-Version': '2022-11-28',
+    Authorization: `Bearer ${token}`,
+  };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
+    });
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    throw new GitHubWriteError('failed', 0);
+  }
+  // A DELETE answers 204 without a body, and a write's success does not depend on its body.
+  const answer: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new GitHubWriteError(
+      writeErrorKind(response),
+      response.status,
+      reason(record(answer)?.message, token)
+    );
+  }
+  return answer;
+}
+
+/**
+ * A GraphQL request, for what GitHub offers only there. GraphQL answers a refusal with 200 and
+ * an `errors` array, so that is a refusal here too, not a success.
+ */
+async function graphql(
+  query: string,
+  variables: Json,
+  token: string,
+  signal?: AbortSignal
+): Promise<Json | null> {
+  const answer = record(await sendRest('POST', '/graphql', { query, variables }, token, signal));
+  if (!answer) throw new GitHubWriteError('failed', 200);
+  const [error] = list(answer.errors);
+  if (error) {
+    const kind =
+      error.type === 'FORBIDDEN' || error.type === 'NOT_FOUND'
+        ? 'noAccess'
+        : error.type === 'RATE_LIMITED'
+        ? 'rateLimited'
+        : 'refused';
+    throw new GitHubWriteError(kind, 200, reason(error.message, token));
+  }
+  return record(answer.data);
 }
 
 type Json = Record<string, unknown>;
@@ -229,10 +348,13 @@ export async function fetchPullRequest(
     ),
     requestedReviewers: list(raw.requested_reviewers).map(actorOf),
     requestedTeams: list(raw.requested_teams).map((team) => text(team.name)),
+    nodeId: text(raw.node_id),
+    mergeable: typeof raw.mergeable === 'boolean' ? raw.mergeable : null,
     mergeableState: textOrNull(raw.mergeable_state),
     autoMerge: autoMerge(record(raw.auto_merge)?.merge_method),
     headSha: text(head?.sha),
     headRepo: textOrNull(record(head?.repo)?.full_name),
+    headRepoId: text(record(head?.repo)?.node_id),
     baseRepo: text(record(base?.repo)?.full_name) || `${ref.owner}/${ref.repo}`,
     mergedAt: textOrNull(raw.merged_at),
     closedAt: textOrNull(raw.closed_at),
@@ -684,4 +806,247 @@ export async function fetchCommitFiles(
   );
   if (!raw) throw new GitHubError('failed', 200);
   return mapFiles(raw.files, `https://github.com/${ref.owner}/${ref.repo}/commit/${sha}`);
+}
+
+export type MergeMethod = 'merge' | 'squash' | 'rebase';
+
+export type Repository = {
+  /** Whether the viewer may merge, close and change the repository's pull requests. */
+  canWrite: boolean;
+  /** The methods the repository allows, in GitHub's order. */
+  mergeMethods: MergeMethod[];
+  autoMergeAllowed: boolean;
+  defaultBranch: string;
+};
+
+const REPOSITORY_QUERY = `query($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    viewerPermission
+    mergeCommitAllowed
+    squashMergeAllowed
+    rebaseMergeAllowed
+    autoMergeAllowed
+    defaultBranchRef { name }
+  }
+}`;
+
+const WRITE_PERMISSIONS: ReadonlySet<unknown> = new Set(['ADMIN', 'MAINTAIN', 'WRITE']);
+
+/** What the viewer may do in a repository, and how it merges; only GraphQL tells both at once. */
+export async function fetchRepository(
+  owner: string,
+  repo: string,
+  token: string,
+  signal?: AbortSignal
+): Promise<Repository> {
+  const data = await graphql(REPOSITORY_QUERY, { owner, repo }, token, signal);
+  const raw = record(data?.repository);
+  if (!raw) throw new GitHubWriteError('failed', 200);
+  const allowed: [MergeMethod, unknown][] = [
+    ['merge', raw.mergeCommitAllowed],
+    ['squash', raw.squashMergeAllowed],
+    ['rebase', raw.rebaseMergeAllowed],
+  ];
+  return {
+    canWrite: WRITE_PERMISSIONS.has(raw.viewerPermission),
+    mergeMethods: allowed.flatMap(([method, on]) => (on === true ? [method] : [])),
+    autoMergeAllowed: raw.autoMergeAllowed === true,
+    defaultBranch: text(record(raw.defaultBranchRef)?.name),
+  };
+}
+
+export type PullRequestAction =
+  | 'merge'
+  | 'enable-auto-merge'
+  | 'disable-auto-merge'
+  | 'ready'
+  | 'draft'
+  | 'close'
+  | 'reopen'
+  | 'update-branch'
+  | 'update-branch-rebase'
+  | 'delete-branch';
+
+// The mutations that take only the pull request.
+const ON_PULL_REQUEST = (mutation: string) =>
+  `mutation($pullRequestId: ID!) {
+  ${mutation}(input: { pullRequestId: $pullRequestId }) { clientMutationId }
+}`;
+
+const ENABLE_AUTO_MERGE = `mutation(
+  $pullRequestId: ID!
+  $mergeMethod: PullRequestMergeMethod!
+  $expectedHeadOid: GitObjectID!
+) {
+  enablePullRequestAutoMerge(
+    input: {
+      pullRequestId: $pullRequestId
+      mergeMethod: $mergeMethod
+      expectedHeadOid: $expectedHeadOid
+    }
+  ) { clientMutationId }
+}`;
+
+const UPDATE_BRANCH = `mutation(
+  $pullRequestId: ID!
+  $expectedHeadOid: GitObjectID!
+  $updateMethod: PullRequestBranchUpdateMethod!
+) {
+  updatePullRequestBranch(
+    input: {
+      pullRequestId: $pullRequestId
+      expectedHeadOid: $expectedHeadOid
+      updateMethod: $updateMethod
+    }
+  ) { pullRequest { headRefOid } }
+}`;
+
+const HEAD_BRANCH_QUERY = `query(
+  $repositoryId: ID!
+  $ref: String!
+  $owner: String!
+  $repo: String!
+  $number: Int!
+) {
+  node(id: $repositoryId) {
+    ... on Repository {
+      ref(qualifiedName: $ref) { target { oid } }
+    }
+  }
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) { state }
+  }
+}`;
+
+const headBranchRef = (pr: PullRequest) => `refs/heads/${pr.headRef}`;
+
+export type HeadBranch = {
+  /** The commit the branch points at in its own repository, or null when the branch is gone. */
+  sha: string | null;
+  /** Whether the pull request is open on GitHub now, whatever the panel last read of it. */
+  pullRequestOpen: boolean;
+};
+
+/**
+ * The pull request's branch as GitHub has it now, with the pull request's own state: what T3
+ * Code reads before it deletes a branch. A name alone does not tell the pull request's branch
+ * from one pushed to since, or made anew under its name, and the state the panel read does not
+ * tell a pull request that was opened again since.
+ */
+export async function fetchHeadBranch(
+  ref: PullRequestRef,
+  pr: PullRequest,
+  token: string,
+  signal?: AbortSignal
+): Promise<HeadBranch> {
+  const { owner, repo, number } = ref;
+  const variables = { repositoryId: pr.headRepoId, ref: headBranchRef(pr), owner, repo, number };
+  const data = await graphql(HEAD_BRANCH_QUERY, variables, token, signal);
+  const repository = record(data?.node);
+  const state = record(record(data?.repository)?.pullRequest)?.state;
+  // Without the repository's `ref` the answer says nothing about the branch, not that it is
+  // gone; and without the pull request's state, not that it is done.
+  if (!repository || !('ref' in repository) || typeof state !== 'string') {
+    throw new GitHubWriteError('failed', 200);
+  }
+  const pullRequestOpen = state === 'OPEN';
+  if (repository.ref === null) return { sha: null, pullRequestOpen };
+  const sha = text(record(record(repository.ref)?.target)?.oid);
+  if (sha === '') throw new GitHubWriteError('failed', 200);
+  return { sha, pullRequestOpen };
+}
+
+// Git's name for no commit: a ref updated to it is deleted.
+const NO_COMMIT = '0000000000000000000000000000000000000000';
+
+const DELETE_BRANCH = `mutation($input: UpdateRefsInput!) {
+  updateRefs(input: $input) { clientMutationId }
+}`;
+
+/**
+ * Deletes the pull request's branch only while it still ends at the pull request's last commit,
+ * as T3 Code does: a branch that got commits since, or that was made anew under the same name
+ * (and may head another pull request), is not this pull request's to delete. GitHub checks
+ * `beforeOid` as it deletes, so a push that comes between the read and the write is refused too.
+ * A branch already gone is what was asked for. And never the branch of a pull request that is
+ * open on GitHub now, though the panel read it as closed: deleting it would close it again.
+ */
+async function deleteHeadBranch(ref: PullRequestRef, pr: PullRequest, token: string) {
+  const { sha, pullRequestOpen } = await fetchHeadBranch(ref, pr, token);
+  if (pullRequestOpen) throw new GitHubWriteError('pullRequestOpen', 0);
+  if (sha === null) return;
+  if (sha !== pr.headSha) throw new GitHubWriteError('branchMoved', 0);
+  const update = { name: headBranchRef(pr), beforeOid: pr.headSha, afterOid: NO_COMMIT };
+  await graphql(
+    DELETE_BRANCH,
+    { input: { repositoryId: pr.headRepoId, refUpdates: [update] } },
+    token
+  );
+}
+
+/**
+ * How an action GitHub took ended. `requested` is an update of the branch that GitHub took but
+ * has not made yet: it may make the branch's new commit after it answers.
+ */
+export type ActionOutcome = 'done' | 'requested';
+
+/**
+ * One action on a pull request, as it was loaded: the writes that depend on its head send the
+ * loaded head sha, so GitHub refuses them if the branch moved since.
+ */
+export async function runPullRequestAction(
+  ref: PullRequestRef,
+  pr: PullRequest,
+  action: PullRequestAction,
+  method: MergeMethod,
+  token: string
+): Promise<ActionOutcome> {
+  const pull = `${repoPath(ref)}/pulls/${ref.number}`;
+  const pullRequestId = pr.nodeId;
+  switch (action) {
+    case 'merge':
+      await sendRest('PUT', `${pull}/merge`, { merge_method: method, sha: pr.headSha }, token);
+      return 'done';
+    case 'close':
+      await sendRest('PATCH', pull, { state: 'closed' }, token);
+      return 'done';
+    case 'reopen':
+      await sendRest('PATCH', pull, { state: 'open' }, token);
+      return 'done';
+    case 'delete-branch':
+      await deleteHeadBranch(ref, pr, token);
+      return 'done';
+    case 'ready':
+      await graphql(ON_PULL_REQUEST('markPullRequestReadyForReview'), { pullRequestId }, token);
+      return 'done';
+    case 'draft':
+      await graphql(ON_PULL_REQUEST('convertPullRequestToDraft'), { pullRequestId }, token);
+      return 'done';
+    case 'disable-auto-merge':
+      await graphql(ON_PULL_REQUEST('disablePullRequestAutoMerge'), { pullRequestId }, token);
+      return 'done';
+    case 'enable-auto-merge':
+      await graphql(
+        ENABLE_AUTO_MERGE,
+        { pullRequestId, mergeMethod: method.toUpperCase(), expectedHeadOid: pr.headSha },
+        token
+      );
+      return 'done';
+    // One path for both ways, as T3 Code. GitHub's answer names the pull request's head: a
+    // new one says the branch is updated, the loaded one that its new commit is still to come.
+    case 'update-branch':
+    case 'update-branch-rebase': {
+      const data = await graphql(
+        UPDATE_BRANCH,
+        {
+          pullRequestId,
+          expectedHeadOid: pr.headSha,
+          updateMethod: action === 'update-branch' ? 'MERGE' : 'REBASE',
+        },
+        token
+      );
+      const head = record(record(data?.updatePullRequestBranch)?.pullRequest)?.headRefOid;
+      return typeof head === 'string' && head !== pr.headSha ? 'done' : 'requested';
+    }
+  }
 }
