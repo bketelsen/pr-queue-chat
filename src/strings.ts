@@ -16,6 +16,8 @@ export const en = {
     treeLabel: 'Files of {{owner}}/{{repo}} #{{number}}',
     collapseFolders: 'Collapse all folders',
     expandFolders: 'Expand all folders',
+    folderLines_one: '{{path}}: {{additions}} line added, {{deletions}} removed',
+    folderLines_other: '{{path}}: {{additions}} lines added, {{deletions}} removed',
     scope: 'Diff scope: {{label}}',
     allCommits: 'All commits',
     commitsLabel: 'Commits',

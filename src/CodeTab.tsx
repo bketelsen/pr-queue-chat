@@ -376,11 +376,6 @@ export function CodeTab({
     () => new Map((viewFiles ?? []).map((file) => [file.path, treeStatus(file.status)])),
     [viewFiles]
   );
-  const entries = useMemo(
-    (): DiffFileTreeEntry[] =>
-      listed.map((path) => ({ path, status: statusByPath.get(path) ?? 'modified' })),
-    [listed, statusByPath]
-  );
 
   const marked = listed
     .filter((path) => markTexts.has(path))
@@ -394,6 +389,17 @@ export function CodeTab({
         ])
       ),
     [viewFiles]
+  );
+  // Only listed files, so a folder's lines leave out hidden test files.
+  const entries = useMemo(
+    (): DiffFileTreeEntry[] =>
+      listed.map((path) => ({
+        path,
+        status: statusByPath.get(path) ?? 'modified',
+        additions: stats.get(path)?.additions ?? 0,
+        deletions: stats.get(path)?.deletions ?? 0,
+      })),
+    [listed, statusByPath, stats]
   );
 
   const updateFolds = (change: (current: Folds) => Partial<Folds>) =>

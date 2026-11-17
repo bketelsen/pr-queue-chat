@@ -2,19 +2,25 @@
 // The changed files as a tree, in Pierre's file tree, with a header that folds every folder.
 import { IconButton, IconTooltip, useThemeKind } from '@mindroom/client-sdk/ui';
 import { usePluginTranslation } from '@mindroom/client-sdk/core';
-import type { GitStatusEntry } from '@pierre/trees';
+import type {
+  FileTreeRowDecoration,
+  FileTreeRowDecorationContext,
+  GitStatusEntry,
+} from '@pierre/trees';
 import { FileTree, useFileTree, useFileTreeSelector } from '@pierre/trees/react';
 import { ChevronsDownUp, ChevronsUpDown } from 'lucide-react';
-import { useEffect, useInsertionEffect, useRef, useState } from 'react';
+import { useEffect, useInsertionEffect, useMemo, useRef, useState } from 'react';
 
 import {
   buildDiffFileTreeUpdates,
   compareDiffFileTreeEntries,
   collectDirectoryPaths,
+  diffFileTreeDirectoryLines,
   diffFileTreeModel,
   diffFileTreePositions,
   type DiffFileTreeEntry,
 } from './diffFileTree.logic';
+import { useLanguage } from '../presentation';
 import { PIERRE_TREE_UNSAFE_CSS, pierreTreeStyle } from './pierreTreeTheme';
 
 export type { DiffFileTreeEntry } from './diffFileTree.logic';
@@ -70,6 +76,7 @@ interface DiffFileTreeProps {
 
 export function DiffFileTree({ entries, onSelectFile, ariaLabel }: DiffFileTreeProps) {
   const t = usePluginTranslation('pull-requests');
+  const language = useLanguage();
   const themeKind = useThemeKind();
   const paths = entries.map((entry) => entry.path);
   const presented = diffFileTreeModel(paths);
@@ -90,6 +97,7 @@ export function DiffFileTree({ entries, onSelectFile, ariaLabel }: DiffFileTreeP
     path: presented.modelPath(entry.path),
     status: entry.status,
   }));
+  const directoryLines = useMemo(() => diffFileTreeDirectoryLines(entries), [entries]);
   const syncingSelectionRef = useRef(false);
   const mountedPresentationRef = useRef<ReturnType<typeof diffFileTreeModel> | null>(null);
 
@@ -102,6 +110,38 @@ export function DiffFileTree({ entries, onSelectFile, ariaLabel }: DiffFileTreeP
     }
   });
 
+  // A folder's changed lines; a file's are in its diff's header. The tree model keeps the first
+  // renderer it was given, and draws after this component's commit, so this reads the latest counts.
+  const renderDirectoryLines = useStableCallback(
+    ({ item }: FileTreeRowDecorationContext): FileTreeRowDecoration | null => {
+      if (item.kind !== 'directory') return null;
+      const lines = directoryLines.get(item.path);
+      if (lines === undefined || (lines.additions === 0 && lines.deletions === 0)) return null;
+      // In the app's language, as the pull request's own line counts are.
+      const format = new Intl.NumberFormat(language);
+      const additions = format.format(lines.additions);
+      const deletions = format.format(lines.deletions);
+      const added = `+${additions}`;
+      const removed = `-${deletions}`;
+      return {
+        text: `${added} ${removed}`,
+        // The plural follows the number; the text shows it formatted, as the row does. The path is
+        // the whole folder's, which a narrow tree may cut. Folders are never aliased, only files;
+        // selectionPath keeps the path real should that change.
+        title: t('code.folderLines', {
+          count: lines.additions,
+          path: presented.selectionPath(item.path).replace(/\/$/, ''),
+          additions,
+          deletions,
+        }),
+        parts: [
+          { text: added, color: 'var(--pr-added)' },
+          { text: removed, color: 'var(--pr-removed)' },
+        ],
+      };
+    }
+  );
+
   const { model } = useFileTree({
     density: 'compact',
     flattenEmptyDirectories: true,
@@ -109,6 +149,7 @@ export function DiffFileTree({ entries, onSelectFile, ariaLabel }: DiffFileTreeP
     icons,
     onSelectionChange: handleSelectionChange,
     paths: [],
+    renderRowDecoration: renderDirectoryLines,
     search: false,
     sort: ordering.sort,
     unsafeCSS: PIERRE_TREE_UNSAFE_CSS,
@@ -170,6 +211,14 @@ export function DiffFileTree({ entries, onSelectFile, ariaLabel }: DiffFileTreeP
     }
     model.setGitStatus(gitStatus);
   }, [directoryPaths, gitStatus, model, modelPaths, ordering, positions, presented]);
+
+  // Pierre draws its rows again on a change of paths or git status, not of counts alone, as when
+  // another commit changed the same files. Setting its composition again is its only public call
+  // that redraws without changing anything, as it does not skip an unchanged value; re-check this
+  // when upgrading @pierre/trees (1.0.0-beta.6).
+  useEffect(() => {
+    model.setComposition(model.getComposition());
+  }, [directoryLines, language, model, t]);
 
   const foldLabel = allDirectoriesExpanded ? t('code.collapseFolders') : t('code.expandFolders');
   return (
