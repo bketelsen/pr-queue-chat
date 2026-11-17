@@ -1,4 +1,4 @@
-// Ported from T3 Code (https://github.com/pingdotgg/t3code, apps/web/src/components/pullRequest/PullRequestCodeTab.tsx at 8ab427c6), MIT, Copyright (c) 2026 T3 Tools Inc. See NOTICE.
+// Ported from T3 Code (https://github.com/pingdotgg/t3code, apps/web/src/components/pullRequest/PullRequestCodeTab.tsx at 8ab427c6 (and 1f698f01d9)), MIT, Copyright (c) 2026 T3 Tools Inc. See NOTICE.
 // The Code tab of the panel, laid out as T3 Code's pull request Code tab: the changed files as a
 // tree beside their diffs, or above them in a narrow panel, both in T3 Code's file order. Choosing
 // a file in the tree scrolls its diff to the top. Review threads show at their lines in the diffs,
@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import {
   createContext,
+  useCallback,
   useContext,
   useMemo,
   useRef,
@@ -42,8 +43,9 @@ import {
   areAllDiffFilesCollapsed,
   getFileViewedRange,
   isFileDiffCollapsed,
-  toggleFileDiffFoldForViewed,
+  withFileDiffFold,
   type DiffFoldOverride,
+  type FileDiffFoldChoices,
 } from './diff/diffFold.logic';
 import { DiffFileTree, type DiffFileTreeEntry } from './diff/DiffFileTree';
 import { orderDiffFilesLikeTree } from './diff/diffFileTree.logic';
@@ -86,7 +88,11 @@ const REPLACE_FILE_COUNTS_CSS = `
 }`;
 
 const NO_THREADS: ReviewThread[] = [];
-const NO_PATHS: ReadonlySet<string> = new Set();
+const NO_FOLDS: FileDiffFoldChoices = new Map();
+
+/** What a file's viewed mark and fold are against: its patch, or its blob without one. */
+const markText = (file: PullRequestFile) =>
+  file.patch ?? (file.sha === null ? '' : `blob:${file.sha}`);
 
 function treeStatus(status: PullRequestFile['status']): GitStatus {
   if (status === 'removed') return 'deleted';
@@ -227,7 +233,7 @@ function ToolbarButton({
 type Folds = {
   view: string;
   override: DiffFoldOverride;
-  toggled: ReadonlySet<string>;
+  choices: FileDiffFoldChoices;
   /** The file last marked or unmarked, where a Shift-click's range starts. */
   anchor: string | null;
 };
@@ -278,35 +284,34 @@ export function CodeTab({
   // in the pull request, in a commit's view, and a file only a commit changes has none. A file
   // GitHub sends no patch for is marked against its blob, which changes with its content.
   const markTexts = useMemo(
-    () =>
-      new Map(
-        files.map((file) => [
-          file.path,
-          file.patch ?? (file.sha === null ? '' : `blob:${file.sha}`),
-        ])
-      ),
+    () => new Map(files.map((file) => [file.path, markText(file)])),
     [files]
   );
 
-  // A view starts, once its files are there, with its viewed files folded, as GitHub shows them;
-  // another commit, or All commits again, starts again.
+  // A file is folded while it is viewed, as GitHub folds it: a mark from another tab folds it, and
+  // a push that changes it opens it. Another commit, or All commits again, drops the reader's
+  // folds. A fold is kept against the file as it is shown, so a push that changes the file drops
+  // the fold too, as T3 Code keys it by the file's diff.
   const view = shownCommit ?? '';
-  const startFolds = (): Folds => ({
-    view,
-    override: null,
-    toggled: new Set(
-      (viewFiles ?? [])
-        .map((file) => file.path)
-        .filter((path) => {
-          const text = markTexts.get(path);
-          return text !== undefined && viewed.stateOf(path, text) === 'viewed';
-        })
-    ),
-    anchor: null,
-  });
-  const [storedFolds, setFolds] = useState(() => (viewFiles ? startFolds() : undefined));
-  if (viewFiles && storedFolds?.view !== view) setFolds(startFolds());
-  const folds = storedFolds?.view === view ? storedFolds : startFolds();
+  const startFolds = (): Folds => ({ view, override: null, choices: NO_FOLDS, anchor: null });
+  const [storedFolds, setFolds] = useState(startFolds);
+  if (storedFolds.view !== view) setFolds(startFolds());
+  const folds = storedFolds.view === view ? storedFolds : startFolds();
+  const foldKeys = useMemo(
+    () =>
+      new Map(
+        (viewFiles ?? []).map((file) => [file.path, `${file.path}#${fnv1a32(markText(file))}`])
+      ),
+    [viewFiles]
+  );
+  const foldKeyOf = useCallback((path: string) => foldKeys.get(path) ?? path, [foldKeys]);
+  const isViewedNow = useCallback(
+    (path: string) => {
+      const text = markTexts.get(path);
+      return text !== undefined && viewed.stateOf(path, text) === 'viewed';
+    },
+    [markTexts, viewed]
+  );
 
   // The highlighted lines depend on the theme, so the parse that caches them carries it in its key.
   const scope = `pull-request:${pullRequest.owner}/${pullRequest.repo}#${pullRequest.number}:${themeKind}`;
@@ -356,7 +361,12 @@ export function CodeTab({
       shownDiffs.map((fileDiff) => {
         const path = resolveFileDiffPath(fileDiff);
         const annotations = placed.annotations.get(path) ?? [];
-        const collapsed = isFileDiffCollapsed(path, folds.override, folds.toggled);
+        const collapsed = isFileDiffCollapsed(
+          foldKeyOf(path),
+          folds.override,
+          folds.choices,
+          isViewedNow(path)
+        );
         return {
           id: path,
           type: 'diff',
@@ -371,7 +381,7 @@ export function CodeTab({
           ),
         };
       }),
-    [shownDiffs, placed, folds.override, folds.toggled]
+    [shownDiffs, placed, folds.override, folds.choices, foldKeyOf, isViewedNow]
   );
   const statusByPath = useMemo(
     () => new Map((viewFiles ?? []).map((file) => [file.path, treeStatus(file.status)])),
@@ -405,18 +415,21 @@ export function CodeTab({
 
   const updateFolds = (change: (current: Folds) => Partial<Folds>) =>
     setFolds((stored) => {
-      const current = stored?.view === view ? stored : folds;
+      const current = stored.view === view ? stored : folds;
       return { ...current, ...change(current) };
     });
   const toggleFolded = (path: string) =>
-    updateFolds((current) => {
-      const toggled = new Set(current.toggled);
-      if (toggled.has(path)) toggled.delete(path);
-      else toggled.add(path);
-      return { toggled };
-    });
+    updateFolds((current) => ({
+      choices: withFileDiffFold(
+        current.choices,
+        foldKeyOf(path),
+        !isFileDiffCollapsed(foldKeyOf(path), current.override, current.choices, isViewedNow(path))
+      ),
+    }));
   // Marking a file viewed folds it and unmarking it unfolds it; Shift-click does so from the
-  // file last marked to this one, as the list shows them.
+  // file last marked to this one, as the list shows them. Before the toolbar's collapse or expand
+  // all is used, a mark drops the reader's fold, so the fold follows the mark; after it, the mark
+  // sets the reader's fold.
   const setViewed = (path: string, extendRange: boolean) => {
     const patch = markTexts.get(path) ?? '';
     const mark = viewed.stateOf(path, patch) !== 'viewed';
@@ -432,9 +445,14 @@ export function CodeTab({
     }
     updateFolds((current) => ({
       anchor: path,
-      toggled: range.reduce(
-        (next, file) => toggleFileDiffFoldForViewed(file.path, mark, current.override, next),
-        current.toggled
+      choices: range.reduce(
+        (next, file) =>
+          withFileDiffFold(
+            next,
+            foldKeyOf(file.path),
+            current.override === null ? undefined : mark
+          ),
+        current.choices
       ),
     }));
   };
@@ -445,7 +463,8 @@ export function CodeTab({
       return patch === undefined ? undefined : viewed.stateOf(path, patch);
     },
     setViewed,
-    foldedOf: (path) => isFileDiffCollapsed(path, folds.override, folds.toggled),
+    foldedOf: (path) =>
+      isFileDiffCollapsed(foldKeyOf(path), folds.override, folds.choices, isViewedNow(path)),
     toggleFolded,
   };
   const allFolded = areAllDiffFilesCollapsed(
@@ -469,9 +488,9 @@ export function CodeTab({
 
   const reveal = (path: string) => {
     if (items.some((item) => item.id === path)) {
-      // A folded file opens as it is revealed.
+      // A folded file opens as it is revealed, and stays open as its mark changes.
       updateFolds((current) => ({
-        toggled: toggleFileDiffFoldForViewed(path, false, current.override, current.toggled),
+        choices: withFileDiffFold(current.choices, foldKeyOf(path), false),
       }));
       viewerRef.current?.scrollTo({ type: 'item', id: path, align: 'start' });
     } else {
@@ -601,7 +620,7 @@ export function CodeTab({
               onClick={() =>
                 updateFolds(() => ({
                   override: allFolded ? 'expanded' : 'folded',
-                  toggled: NO_PATHS,
+                  choices: NO_FOLDS,
                 }))
               }
             >
