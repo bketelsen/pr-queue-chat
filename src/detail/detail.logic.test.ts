@@ -284,6 +284,9 @@ describe('checks', () => {
     expect(checksState([check('success'), check('action-required')])).toBe('pending');
     expect(checksState([check('success'), check('pending')])).toBe('pending');
     expect(checksState([check('success'), check('skipped'), check('neutral')])).toBe('passing');
+    // None failed or runs, and none passed either: nothing to call passing.
+    expect(checksState([check('skipped'), check('neutral')])).toBe('skipped');
+    expect(checksState([check('skipped'), check('pending')])).toBe('pending');
   });
 
   it('summarizes failing first, then awaiting action, then running', () => {
@@ -319,9 +322,22 @@ describe('checks', () => {
     expect(summarizeChecks([check('success'), check('success')])).toEqual(
       summary('allPassed', 2, 2)
     );
-    expect(summarizeChecks([check('success'), check('skipped'), check('neutral')])).toEqual(
-      summary('passing', 1, 3)
-    );
+    // Skipped and neutral checks do not fail, as on GitHub: the line says what they are.
+    expect(summarizeChecks([check('success'), check('skipped'), check('skipped')])).toEqual({
+      ...summary('passedSkipped', 1, 3),
+      skipped: 2,
+      neutral: 0,
+    });
+    expect(summarizeChecks([check('success'), check('neutral')])).toEqual({
+      ...summary('passedNeutral', 1, 2),
+      skipped: 0,
+      neutral: 1,
+    });
+    expect(summarizeChecks([check('success'), check('skipped'), check('neutral')])).toEqual({
+      ...summary('passedSkippedNeutral', 1, 3),
+      skipped: 1,
+      neutral: 1,
+    });
   });
 
   it('groups checks that need attention, running ones and completed ones', () => {

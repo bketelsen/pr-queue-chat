@@ -59,7 +59,8 @@ export const en = {
   updated: 'updated {{time}}',
   receivesChanges: 'receives changes from',
   tab: { summary: 'Summary', timeline: 'Timeline', code: 'Code' },
-  copyCheckout: 'Copy checkout command',
+  // Names the command it copies, in its tooltip and to a screen reader.
+  copyCheckout: 'Copy checkout command: {{command}}',
   badge: { autoMerge: 'Auto-merge ({{method}})' },
   // The header's actions on a pull request: its primary control, the menu, the delete dialog
   // and the line under the header that says what runs and what failed. `pending`, `failed` and
@@ -207,7 +208,10 @@ export const en = {
     checksAwaitingAction_other: '{{count}} checks awaiting action',
     running: '{{count}} of {{total}} running',
     allPassed: 'All checks have passed',
-    passing: '{{count}} of {{total}} passing',
+    // None failed or runs, but some were skipped or ended neutral, which GitHub counts as passing.
+    passedSkipped: '{{count}} passed, {{skipped}} skipped',
+    passedNeutral: '{{count}} passed, {{neutral}} neutral',
+    passedSkippedNeutral: '{{count}} passed, {{skipped}} skipped, {{neutral}} neutral',
   },
   checkStatus: {
     pending: 'Running',
@@ -223,6 +227,7 @@ export const en = {
     passing: 'All checks have passed',
     failing: 'Some checks were not successful',
     pending: "Some checks haven't completed yet",
+    skipped: 'All checks were skipped or neutral',
   },
   checksPopover: {
     none: 'No checks reported',
@@ -233,6 +238,8 @@ export const en = {
     label: 'Checks',
   },
   checksLine: {
+    // The checks line where the tab bar has no room for the summary: passed over all.
+    short: '{{passed}}/{{total}}',
     none: 'No checks',
     loading: 'Loading checks',
     unavailable: 'Checks unavailable',
@@ -348,6 +355,7 @@ export const en = {
       passing: 'checks passed',
       failing: 'checks failed',
       pending: 'checks running',
+      skipped: 'checks skipped',
     },
     thisWorktree: 'this worktree',
     worktree: 'Worktree',
@@ -407,8 +415,12 @@ export const en = {
     removeFailed: 'MindRoom could not remove the token.',
     removed: 'Token removed from MindRoom.',
     overrides: 'A token saved here is used instead.',
-    useToken: 'Use a token instead',
-    // Closes the form opened by Use a token instead, keeping MindRoom's connection.
+    // In the header's More actions menu, while the requests go through MindRoom: who they go as,
+    // then the entry that opens the form to use a token from this browser instead.
+    menuStatus: 'Signed in as {{login}} through MindRoom',
+    menuStatusNoLogin: 'Signed in through MindRoom',
+    useToken: 'Use a token in this browser',
+    // Closes the form opened by Use a token in this browser, keeping MindRoom's connection.
     cancel: 'Cancel',
   },
 };

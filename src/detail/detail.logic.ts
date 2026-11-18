@@ -121,9 +121,12 @@ export function joinReviewers(outcomes: ReviewOutcome[], requested: Actor[]): Re
   ];
 }
 
-export type ChecksState = 'none' | 'passing' | 'failing' | 'pending';
+export type ChecksState = 'none' | 'passing' | 'failing' | 'pending' | 'skipped';
 
-/** The checks taken together: failing over pending over passing. */
+/**
+ * The checks taken together: failing over pending over passing; `skipped` once all ended skipped
+ * or neutral, with none failed and none passed, which nothing calls passing.
+ */
 export function checksState(checks: PullRequestCheck[]): ChecksState {
   if (checks.length === 0) return 'none';
   if (checks.some((check) => check.status === 'failure' || check.status === 'cancelled')) {
@@ -132,7 +135,7 @@ export function checksState(checks: PullRequestCheck[]): ChecksState {
   if (checks.some((check) => check.status === 'pending' || check.status === 'action-required')) {
     return 'pending';
   }
-  return 'passing';
+  return checks.some((check) => check.status === 'success') ? 'passing' : 'skipped';
 }
 
 export function isWorkflowApprovalCheck(check: Pick<PullRequestCheck, 'status' | 'url'>): boolean {
@@ -152,19 +155,25 @@ export type ChecksSummaryKey =
   | 'checksAwaitingAction'
   | 'running'
   | 'allPassed'
-  | 'passing';
+  | 'passedSkipped'
+  | 'passedNeutral'
+  | 'passedSkippedNeutral';
 
 /**
  * The checks' summary line as the key of its text under `checks` in the plugin's strings, with the
  * numbers the text needs: `total` checks, `count` of them that the text is about (failing, awaiting
- * action that is not a workflow approval, running or passing; workflows awaiting approval for
- * `workflowsAwaitingApproval`), and the `workflows` awaiting approval.
+ * action that is not a workflow approval, running or passed; workflows awaiting approval for
+ * `workflowsAwaitingApproval`), and the `workflows` awaiting approval. Once every check ended
+ * without failing but not all passed, also the `skipped` and `neutral` ones, which GitHub does
+ * not count as failing either: the line says what they are, not that they do not pass.
  */
 export type ChecksSummary = {
   key: ChecksSummaryKey;
   count: number;
   total: number;
   workflows: number;
+  skipped?: number;
+  neutral?: number;
 };
 
 /** What the checks line says: what fails, else what waits for someone, else what runs. */
@@ -192,7 +201,12 @@ export function summarizeChecks(checks: PullRequestCheck[]): ChecksSummary {
   if (workflows > 0) return summary('workflowsAwaitingApproval', workflows);
   if (otherActionRequired > 0) return summary('checksAwaitingAction', otherActionRequired);
   if (pending > 0) return summary('running', pending);
-  return summary(passed === total ? 'allPassed' : 'passing', passed);
+  if (passed === total) return summary('allPassed', passed);
+  const skipped = checks.filter((check) => check.status === 'skipped').length;
+  const neutral = total - passed - skipped;
+  const key =
+    neutral === 0 ? 'passedSkipped' : skipped === 0 ? 'passedNeutral' : 'passedSkippedNeutral';
+  return { ...summary(key, passed), skipped, neutral };
 }
 
 export function groupChecks(checks: PullRequestCheck[]): {
