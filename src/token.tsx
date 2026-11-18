@@ -108,9 +108,15 @@ type ServerStatus = {
   via?: 'token' | 'app';
   /** While `via` is the token: whether MindRoom goes with the App once the token is removed. */
   appConnected?: boolean;
+  /**
+   * While not connected: MindRoom cannot read the token saved there (`503
+   * github_token_unreadable`), and uses nothing until another is saved or it is removed.
+   */
+  unreadable?: boolean;
 };
 
 const NOT_CONNECTED: ServerStatus = { connected: false, login: undefined };
+const UNREADABLE: ServerStatus = { connected: false, login: undefined, unreadable: true };
 
 // Not under `pull-requests`, whose queries a new token asks again: the status is the server's.
 const statusKey = (origin: string) => ['pull-requests-github-status', origin] as const;
@@ -123,7 +129,11 @@ const statusStaleTime = (status: ServerStatus | undefined) =>
 
 /** Which connection a status names, for telling when it changed. */
 const identity = (status: ServerStatus) =>
-  status.connected ? `connected:${status.via ?? ''}:${status.login ?? ''}` : 'none';
+  status.connected
+    ? `connected:${status.via ?? ''}:${status.login ?? ''}`
+    : status.unreadable
+    ? 'unreadable'
+    : 'none';
 
 /** How GitHub is reached in a key of `queries.ts`, after the pull request or the repository. */
 const accessOf = (queryKey: QueryKey) => queryKey[queryKey[1] === 'repo' ? 4 : 5];
@@ -231,9 +241,13 @@ const statusQuery = (queryClient: QueryClient, server: MindroomServer | undefine
     const { origin } = server as MindroomServer;
     const { fence } = credentialOf(queryClient, origin);
     // The limit is each request's own: the query keeps this function for whoever asks next.
-    const now = statusOf(
-      await (server as MindroomServer).request('/api/github/status', { signal: changeLimit() })
-    );
+    const now = await (server as MindroomServer)
+      .request('/api/github/status', { signal: changeLimit() })
+      .then(statusOf, (error: unknown) => {
+        // Asking again would get the same: this one is a state of its own, kept as a status.
+        if (isUnreadable(error)) return UNREADABLE;
+        throw error;
+      });
     if (fence !== credentialOf(queryClient, origin).fence) {
       return queryClient.getQueryData<ServerStatus>(statusKey(origin)) ?? now;
     }
@@ -267,6 +281,11 @@ function viaServer(
         setStatus(queryClient, server.origin, NOT_CONNECTED);
       }
     },
+    unreadable: () => {
+      if (fence === credentialOf(queryClient, server.origin).fence) {
+        setStatus(queryClient, server.origin, UNREADABLE);
+      }
+    },
   };
 }
 
@@ -283,6 +302,11 @@ export type GitHubAccess = {
   connection: 'token' | 'app' | undefined;
   /** With the token saved in MindRoom: whether the GitHub App is used once it is removed. */
   appConnected: boolean;
+  /**
+   * MindRoom cannot read the token saved there, with no token stored: nothing goes through it
+   * (`via` is undefined) until another is saved there or it is removed.
+   */
+  unreadable: boolean;
   /**
    * What the query keys carry of it, never a token: false without either, true with the token,
    * `server:<origin>:<login>:<generation>` through MindRoom (`unknown` for a login the server
@@ -310,8 +334,7 @@ export type GitHubAccess = {
   authFor(key: AccessKey): GitHubAuth | undefined;
   /**
    * Asks the server again whether GitHub is connected there, as a part's Try again does; resolves
-   * to whether the parts read again by themselves now, under the keys of another connection: one
-   * that differs from the one before, or the first connected one when none was known.
+   * to whether the parts read again by themselves now: whether the key a read starts with changed.
    */
   recheck(): Promise<boolean>;
 };
@@ -342,6 +365,12 @@ function refusalOf(error: unknown): { status: number; code: unknown } {
   const code =
     typeof body === 'object' && body !== null ? (body as { error?: unknown }).error : undefined;
   return { status, code };
+}
+
+/** Whether MindRoom answered that it cannot read the token saved there. */
+function isUnreadable(error: unknown): boolean {
+  const { status, code } = refusalOf(error);
+  return status === 503 && code === 'github_token_unreadable';
 }
 
 /**
@@ -416,8 +445,10 @@ function useServerToken() {
           // the token of this browser as it was.
           if (!saved.connected || saved.via !== 'token') throw new Error('not saved');
           // Saving answers with the token's account alone; the status says whether the App
-          // connection is there too.
-          return askStatus(queryClient, server).catch(() => saved);
+          // connection is there too. One that cannot read the token just saved did not save it.
+          const now = await askStatus(queryClient, server).catch(() => saved);
+          if (now.unreadable) throw new Error('not saved');
+          return now;
         });
         if (error === undefined) {
           // The token of this browser comes first, and would hide the one just saved.
@@ -444,40 +475,167 @@ function useServerToken() {
   }, [forget, origin, queryClient, server, storedToken, writing]);
 }
 
-/** Removes the token saved in MindRoom, while the requests through MindRoom go with it. */
-export function RemoveServerToken() {
+/**
+ * That a token was removed from MindRoom: the origin it was removed from, and whether the note
+ * that says so takes the focus, once, as the button that had it went.
+ */
+type Removal = { origin: string; focus: boolean };
+type RemovedToken = {
+  removed: Removal | undefined;
+  setRemoved(removal: Removal | undefined): void;
+  /**
+   * The element the panel focused in place of a control that went with the focus, while it has
+   * held the focus ever since: the focus is lost there, not put there by the person.
+   */
+  placed: MutableRefObject<Element | null>;
+};
+
+/** Where a token's removal is kept, for one part whose own parts may go and come back meanwhile. */
+function useRemovedToken(): RemovedToken {
+  const [removed, setRemoved] = useState<Removal>();
+  const placed = useRef<Element | null>(null);
+  return useMemo(() => ({ removed, setRemoved, placed }), [removed]);
+}
+
+/**
+ * Focuses an element in place of a control that went while it had the focus; until that element
+ * loses the focus, a removal counts the focus there as lost (`RemovedToken.placed`).
+ */
+export function usePlaceFocus(): (element: HTMLElement | null | undefined) => void {
+  const { placed } = useContext(RemovedTokenContext) ?? NO_REMOVAL;
+  return useCallback(
+    (element) => {
+      if (!element) return;
+      element.focus();
+      placed.current = element;
+      const lost = () => {
+        if (placed.current === element) placed.current = null;
+      };
+      element.addEventListener('blur', lost, { once: true });
+    },
+    [placed]
+  );
+}
+
+const NO_REMOVAL: RemovedToken = {
+  removed: undefined,
+  setRemoved: () => undefined,
+  placed: { current: null },
+};
+const RemovedTokenContext = createContext<RemovedToken | undefined>(undefined);
+
+/**
+ * The panel's: there what removed the token goes once it is removed (the header, an error), and
+ * what shows next may be another of them, so the panel says it was removed (`RemovedTokenNote`).
+ * Forgotten with the panel.
+ */
+export function RemovedTokenProvider({ children }: { children: ReactNode }) {
+  const value = useRemovedToken();
+  return <RemovedTokenContext.Provider value={value}>{children}</RemovedTokenContext.Provider>;
+}
+
+/**
+ * Says that the token was removed from MindRoom, from the room's server, and takes the focus as it
+ * does: the button that removed it goes with it. Gone once a token is used again.
+ */
+export function RemovedTokenNote({
+  note: own,
+  className,
+}: {
+  /** Whose removal it says; the panel's, inside it, without one. */
+  note?: RemovedToken;
+  /** For a note of its own line: the class of the paragraph it is then. */
+  className?: string;
+}) {
+  const lifted = useContext(RemovedTokenContext);
+  const note = own ?? lifted ?? NO_REMOVAL;
   const t = usePluginTranslation('pull-requests');
-  const { via, connection, appConnected } = useGitHubAccess();
+  const { via, connection } = useGitHubAccess();
+  const serverToken = useServerToken();
+  const said = useRef<HTMLSpanElement>(null);
+  const writing = serverToken?.writing === true;
+  const removal = note.removed;
+  const removed = serverToken !== undefined && removal?.origin === serverToken.origin;
+  // A token saved again, here or in the browser, is not the one removed.
+  const used = via === 'token' || (via === 'server' && connection === 'token');
+  const shown = removed && !used;
+  const focus = shown && removal?.focus === true;
+  const { setRemoved } = note;
+  useEffect(() => {
+    if (removed && used && !writing) setRemoved(undefined);
+  }, [removed, setRemoved, used, writing]);
+  useEffect(() => {
+    if (!focus || !removal) return;
+    said.current?.focus();
+    setRemoved({ ...removal, focus: false });
+  }, [focus, removal, setRemoved]);
+  // Always there, a live region that says it also where the focus stays elsewhere.
+  const text = shown ? (
+    <span ref={said} tabIndex={-1}>
+      {t('token.removed')}
+    </span>
+  ) : null;
+  return className === undefined ? (
+    <span aria-live="polite">{text}</span>
+  ) : (
+    <p className={className} aria-live="polite">
+      {text}
+    </p>
+  );
+}
+
+/**
+ * Removes the token saved in MindRoom, while the requests through MindRoom go with it. With
+ * `onRemoved`, its owner is told how the removal ended and says a failure itself.
+ */
+export function RemoveServerToken({ onRemoved }: { onRemoved?: (done: boolean) => void }) {
+  const lifted = useContext(RemovedTokenContext);
+  const own = useRemovedToken();
+  // Outside the panel it says itself that the token was removed, where it was.
+  return lifted ? (
+    <RemoveButton note={lifted} onRemoved={onRemoved} />
+  ) : (
+    <>
+      <RemoveButton note={own} onRemoved={onRemoved} />
+      <RemovedTokenNote note={own} />
+    </>
+  );
+}
+
+function RemoveButton({
+  note,
+  onRemoved,
+}: {
+  note: RemovedToken;
+  onRemoved?: (done: boolean) => void;
+}) {
+  const t = usePluginTranslation('pull-requests');
+  const { via, connection, appConnected, unreadable } = useGitHubAccess();
   const serverToken = useServerToken();
   const [failed, setFailed] = useState(false);
-  const [removed, setRemoved] = useState(false);
   const fallsBack = useId();
-  const said = useRef<HTMLSpanElement>(null);
-  const shown = via === 'server' && connection === 'token' && serverToken !== undefined;
-  // The button goes once the token is removed: focus goes to what says so, not to the page.
-  useEffect(() => {
-    if (removed && !shown) said.current?.focus();
-  }, [removed, shown]);
-  // A token saved again is not the one removed: one that goes later was not removed here.
-  if (shown && removed && !serverToken.writing) setRemoved(false);
-  if (!shown) {
-    return removed ? (
-      <span ref={said} tabIndex={-1}>
-        {t('token.removed')}
-      </span>
-    ) : null;
-  }
+  const button = useRef<HTMLButtonElement>(null);
+  // Also the token MindRoom cannot read, which removing there mends.
+  const shown =
+    ((via === 'server' && connection === 'token') || unreadable) && serverToken !== undefined;
+  if (!shown) return null;
   const remove = async () => {
     if (serverToken.busy()) return;
     setFailed(false);
-    setRemoved(false);
+    note.setRemoved(undefined);
     const done = await serverToken.remove();
     setFailed(!done);
-    setRemoved(done);
+    // The focus follows from the button, or from where it fell once the button went, but not
+    // from where the person moved it meanwhile.
+    const active = document.activeElement;
+    const focus = [null, document.body, button.current, note.placed.current].includes(active);
+    note.setRemoved(done ? { origin: serverToken.origin, focus } : undefined);
+    onRemoved?.(done);
   };
   return (
     <>
       <button
+        ref={button}
         type="button"
         className="mrpr-link-button"
         // Not disabled, which would take the focus from it while it is pressed.
@@ -493,7 +651,7 @@ export function RemoveServerToken() {
           <span id={fallsBack}>{t('token.removeFallsBack')}</span>
         </>
       ) : null}
-      {failed ? <span role="alert"> {t('token.removeFailed')}</span> : null}
+      {failed && !onRemoved ? <span role="alert"> {t('token.removeFailed')}</span> : null}
     </>
   );
 }
@@ -522,6 +680,8 @@ export function useGitHubAccess(): GitHubAccess {
   const login = connected ? status.data?.login : undefined;
   const connection = connected ? status.data?.via : undefined;
   const appConnected = connected && status.data?.appConnected === true;
+  const unreadable =
+    server !== undefined && token === undefined && status.data?.unreadable === true;
   const current = useCallback((): { key: AccessKey; auth: GitHubAuth | undefined } => {
     const stored = storedToken();
     if (stored !== undefined) return { key: true, auth: stored };
@@ -549,21 +709,19 @@ export function useGitHubAccess(): GitHubAccess {
     if (!server || storedToken() !== undefined) return false;
     // The parts read again by themselves once the token is saved or removed.
     if (credentialOf(queryClient, server.origin).writing) return true;
-    const key = statusKey(server.origin);
-    const before = queryClient.getQueryData<ServerStatus>(key);
-    await queryClient.invalidateQueries({ queryKey: key });
-    const now = queryClient.getQueryData<ServerStatus>(key);
-    if (now === undefined) return false;
-    // A first status after a failed one reads everything again only when it is connected,
-    // through the new keys; one that is not leaves the reading again to the caller.
-    return before === undefined ? now.connected : identity(before) !== identity(now);
-  }, [queryClient, server, storedToken]);
+    const before = current().key;
+    await queryClient.invalidateQueries({ queryKey: statusKey(server.origin) });
+    // Only the parts under another key read by themselves; a status that changed and left the
+    // key (as from a token MindRoom cannot read to none, both anonymous) leaves it to the caller.
+    return current().key !== before;
+  }, [current, queryClient, server, storedToken]);
   return useMemo(
     () => ({
       via: token !== undefined ? 'token' : connected ? 'server' : undefined,
       login,
       connection,
       appConnected,
+      unreadable,
       // While a token is saved or removed there, the key before: what was read stays on screen.
       key:
         token !== undefined
@@ -592,6 +750,7 @@ export function useGitHubAccess(): GitHubAccess {
       serverPending,
       status.isPending,
       token,
+      unreadable,
     ]
   );
 }
@@ -605,19 +764,25 @@ const hostOf = (origin: string) => {
   }
 };
 
+/** Why the token form shows, which its hint says. */
+export type TokenFormReason = 'notFound' | 'rateLimited' | 'badToken' | 'unreadable' | 'override';
+
 export function TokenForm({
   reason,
   inputRef,
   onCancel,
-  onSaved,
+  onDone,
 }: {
-  /** Why it shows; `override`, to use a token instead of MindRoom's connection, has no hint. */
-  reason: 'notFound' | 'rateLimited' | 'badToken' | 'override';
+  /**
+   * Why it shows; `override`, to use a token instead of MindRoom's connection, has no hint;
+   * `unreadable`, MindRoom cannot read the token saved there, also offers to remove it.
+   */
+  reason: TokenFormReason;
   inputRef?: Ref<HTMLInputElement>;
   /** Closes the form without saving, for one the person opened; without it, none shows. */
   onCancel?: () => void;
-  /** Once a token is saved, in the browser or in MindRoom. */
-  onSaved?: () => void;
+  /** Once a token is saved from it, in the browser or in MindRoom, or removed from it. */
+  onDone?: () => void;
 }) {
   const t = usePluginTranslation('pull-requests');
   const { token, setToken } = useGitHubToken();
@@ -631,6 +796,8 @@ export function TokenForm({
   if (chosen !== undefined && chosen !== serverToken?.origin) setChosen(undefined);
   const [saving, setSaving] = useState(false);
   const [problem, setProblem] = useState<SaveProblem>();
+  // Said here, as Remove may go with the status the failed removal leaves.
+  const [removeFailed, setRemoveFailed] = useState(false);
   const field = useRef<HTMLInputElement | null>(null);
   const setField = useCallback(
     (element: HTMLInputElement | null) => {
@@ -647,10 +814,11 @@ export function TokenForm({
     const trimmed = value.trim();
     if (trimmed === '' || serverToken?.busy()) return;
     setProblem(undefined);
+    setRemoveFailed(false);
     if (!inMindroom) {
       setValue('');
       setToken(trimmed);
-      onSaved?.();
+      onDone?.();
       return;
     }
     setSaving(true);
@@ -663,7 +831,11 @@ export function TokenForm({
       return;
     }
     setValue('');
-    onSaved?.();
+    onDone?.();
+  };
+  const removed = (done: boolean) => {
+    setRemoveFailed(!done);
+    if (done) onDone?.();
   };
   return (
     <form className="mrpr-token" onSubmit={(event) => void submit(event)}>
@@ -672,7 +844,14 @@ export function TokenForm({
           <GitHubConnectedNote /> {t('token.overrides')}
         </p>
       ) : null}
-      {reason === 'override' ? null : <p className="mrpr-status">{t(`token.hint.${reason}`)}</p>}
+      {reason === 'unreadable' ? (
+        <p className="mrpr-status">
+          <span role="alert">{t('token.hint.unreadable')}</span>{' '}
+          <RemoveServerToken onRemoved={removed} />
+        </p>
+      ) : reason === 'override' ? null : (
+        <p className="mrpr-status">{t(`token.hint.${reason}`)}</p>
+      )}
       <div className="mrpr-token-row">
         <input
           ref={setField}
@@ -719,6 +898,11 @@ export function TokenForm({
           ))}
         </div>
       ) : null}
+      {removeFailed ? (
+        <p className="mrpr-status" role="alert">
+          {t('token.removeFailed')}
+        </p>
+      ) : null}
       {problem ? (
         <p className="mrpr-status" role="alert">
           {t(`token.problem.${problem}`)}
@@ -747,26 +931,27 @@ export const PanelTokenFormContext = createContext<PanelTokenFormState | undefin
  * The panel's token form: shown while one of its parts shows a failure that a token fixes, GitHub's
  * rate limit before not finding the repository, and focused from those parts.
  */
-export function usePanelTokenForm() {
-  const [needs, setNeeds] = useState<readonly TokenReason[]>([]);
+export function usePanelTokenForm(scope: string) {
+  // Each ask holds the scope (server and pull request) it was made for, and counts only there.
+  const [needs, setNeeds] = useState<readonly { reason: TokenReason; scope: string }[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
   const context = useMemo(
     (): PanelTokenFormState => ({
       need: (reason) => {
-        setNeeds((current) => [...current, reason]);
-        return () =>
-          setNeeds((current) => {
-            const index = current.indexOf(reason);
-            return index < 0 ? current : [...current.slice(0, index), ...current.slice(index + 1)];
-          });
+        const ask = { reason, scope: scopeRef.current };
+        setNeeds((current) => [...current, ask]);
+        return () => setNeeds((current) => current.filter((need) => need !== ask));
       },
       focus: () => inputRef.current?.focus(),
     }),
     []
   );
-  const reason: TokenReason | undefined = needs.includes('rateLimited')
+  const asked = needs.filter((need) => need.scope === scope).map((need) => need.reason);
+  const reason: TokenReason | undefined = asked.includes('rateLimited')
     ? 'rateLimited'
-    : needs.includes('notFound')
+    : asked.includes('notFound')
     ? 'notFound'
     : undefined;
   return { context, reason, inputRef };

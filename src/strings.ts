@@ -86,6 +86,8 @@ export const en = {
       'delete-branch': 'Deleting branch...',
     },
     conflicts: 'Conflicts',
+    // In place of Merge, while GitHub still computes whether the pull request merges.
+    checking: 'Checking whether it can merge...',
     more: 'More actions',
     methodGroup: 'Merge method',
     mergeNow: 'Merge now',
@@ -375,6 +377,8 @@ export const en = {
       notFound: 'A token that can read the repository shows it.',
       rateLimited: 'A token raises the limit.',
       badToken: 'Save another token to replace it.',
+      // MindRoom answers that it cannot read the token saved there, which asking again does not mend.
+      unreadable: 'MindRoom cannot read the token saved there. Save a new one or remove it.',
     },
     note: "The token stays in this browser, where the page's scripts can read it.",
     noteMindroom: 'MindRoom keeps the token for your account and uses it on every device.',

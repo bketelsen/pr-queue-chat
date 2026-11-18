@@ -1,7 +1,9 @@
+import { useEffect, useState } from 'react';
 import {
   isCancelledError,
   useQueries,
   useQuery,
+  useQueryClient,
   type Query,
   type QueryClient,
 } from '@tanstack/react-query';
@@ -113,6 +115,52 @@ const pullRequestQuery = (
 
 export function usePullRequest(ref: PullRequestRef | undefined, options: RefetchOptions = {}) {
   return useQuery(pullRequestQuery(ref, useGitHubAccess(), options));
+}
+
+// GitHub computes whether a pull request merges after its base moved, in about a second; until
+// then its `mergeable` is null. It is read again after each of these, while it still is.
+const MERGEABLE_RECHECKS = [1_000, 2_000, 4_000];
+
+/**
+ * While GitHub still computes whether the open pull request `pr` merges (`mergeable` null), reads
+ * it again a few times, later each time, under the key it shows now and while it shows (`enabled`
+ * and mounted); true meanwhile, so that what depends on it waits. Once the reads are spent, what
+ * depends on it goes by GitHub's answer then. Another key, an answer, or the pull request changed
+ * on GitHub (its `updatedAt` or head) starts the count afresh.
+ * None starts while `paused` (an action runs): the read after it is the action's own.
+ */
+export function useMergeableRecheck(
+  ref: PullRequestRef | undefined,
+  pr: PullRequest | undefined,
+  enabled: boolean,
+  paused: boolean
+): boolean {
+  const queryClient = useQueryClient();
+  const { key } = useGitHubAccess();
+  const scope = JSON.stringify([keyOf(ref, key), pr?.updatedAt, pr?.headSha]);
+  const unknown = enabled && ref !== undefined && pr?.state === 'open' && pr.mergeable === null;
+  const [reads, setReads] = useState({ scope, count: 0 });
+  if (reads.scope !== scope || (!unknown && reads.count !== 0)) setReads({ scope, count: 0 });
+  const count = unknown && reads.scope === scope ? reads.count : 0;
+  useEffect(() => {
+    if (!unknown || paused || count >= MERGEABLE_RECHECKS.length) return undefined;
+    // A read that ends after the key changed, or the panel went, counts for none.
+    let live = true;
+    const timer = setTimeout(() => {
+      void queryClient
+        // Joining a read under way, which may be an action's, rather than replacing it.
+        .refetchQueries(
+          { queryKey: keyOf(ref, key), exact: true, type: 'active' },
+          { cancelRefetch: false }
+        )
+        .finally(() => live && setReads({ scope, count: count + 1 }));
+    }, MERGEABLE_RECHECKS[count]);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [count, key, paused, queryClient, ref, scope, unknown]);
+  return unknown && count < MERGEABLE_RECHECKS.length;
 }
 
 /** The pull requests `refs` as `usePullRequest` reads each, through the same queries. */

@@ -32,7 +32,13 @@ import {
   type PullRequestAction,
   type PullRequestRef,
 } from '../github';
-import { pullRequestKey, repositoryKey, useChecks, useHeadBranchSha } from '../queries';
+import {
+  pullRequestKey,
+  repositoryKey,
+  useChecks,
+  useHeadBranchSha,
+  useMergeableRecheck,
+} from '../queries';
 import { pluginRootStyle } from '../theme';
 import { useGitHubAccess } from '../token';
 import { mayDeleteBranch, menuActions, primaryControl, showsOutcome } from './actions.logic';
@@ -94,6 +100,8 @@ export function HeaderActions({
   const canWrite = repo?.canWrite === true;
   // The same query as the checks line, so it costs no request of its own where that one shows.
   const checks = useChecks(pullRequestRef, pr.headSha, canWrite);
+  // While GitHub still computes whether it merges, the pull request is read again for that.
+  const checking = useMergeableRecheck(pullRequestRef, pr, canWrite, pending !== null);
   // Asked only for a branch that could be deleted at all; the menu offers it while it still
   // ends where the pull request does, so not once it is deleted.
   const headBranch = useHeadBranchSha(
@@ -146,11 +154,16 @@ export function HeaderActions({
   const primary = primaryControl(
     pr,
     repo,
-    checks.data ? checksState(checks.data.items) : undefined
+    checks.data ? checksState(checks.data.items) : undefined,
+    checking
   );
   const listed = menuActions(pr, repo, primary, headBranch.data);
   const showsMethods =
-    pr.state === 'open' && !pr.draft && primary !== 'conflicts' && repo.mergeMethods.length > 1;
+    pr.state === 'open' &&
+    !pr.draft &&
+    primary !== 'conflicts' &&
+    primary !== 'checking' &&
+    repo.mergeMethods.length > 1;
   // The action the primary control starts, which shows that it runs itself.
   const primaryAction: PullRequestAction | null =
     primary === 'merge' || primary === 'enable-auto-merge' || primary === 'ready' ? primary : null;
@@ -180,6 +193,18 @@ export function HeaderActions({
     primaryControlElement = (
       <span className="mrpr-badge mrpr-badge-error">{t('actions.conflicts')}</span>
     );
+  } else if (primary === 'checking') {
+    // The button Merge is, off while GitHub computes: one focused keeps the focus.
+    primaryControlElement = (
+      <button
+        type="button"
+        className="mrpr-button mrpr-button-primary"
+        aria-disabled
+        aria-live="polite"
+      >
+        {t('actions.checking')}
+      </button>
+    );
   } else if (primary === 'ready') {
     primaryControlElement = (
       <button
@@ -199,6 +224,8 @@ export function HeaderActions({
       <button
         type="button"
         className="mrpr-button mrpr-button-primary"
+        // Says what it became, Checking whether it can merge... among them.
+        aria-live="polite"
         {...off}
         {...armable}
         onClick={busy ? undefined : onClick}

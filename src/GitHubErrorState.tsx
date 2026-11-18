@@ -3,6 +3,7 @@ import { GitHubError } from './github';
 import {
   RemoveServerToken,
   TokenForm,
+  type TokenFormReason,
   useGitHubAccess,
   useGitHubToken,
   usePanelTokenFormFor,
@@ -28,6 +29,22 @@ export function useGitHubErrorMessage(error: unknown): string {
 }
 
 /**
+ * Why a token form shows beside `error`, the view of a read that gave no pull request, or none:
+ * the token MindRoom cannot read is what to mend, beside any failure; a read that failed of itself
+ * (no answer, or GitHub's own error) takes none, nor a rate limit that another token would not
+ * raise (MindRoom's connection has a token's).
+ */
+export function useErrorTokenReason(error: unknown): TokenFormReason | undefined {
+  const { token } = useGitHubToken();
+  const { via, unreadable } = useGitHubAccess();
+  const kind = error instanceof GitHubError ? error.kind : 'failed';
+  if (unreadable) return 'unreadable';
+  if (kind === 'failed' || (kind === 'rateLimited' && via !== undefined)) return undefined;
+  if (kind === 'notFound' && token !== undefined) return 'badToken';
+  return kind === 'badToken' && via === 'server' ? 'override' : kind;
+}
+
+/**
  * What the card and the panel say when GitHub's answer is no pull request: why, and what to do.
  * A part inside the panel's tabs is `compact`: the reason and a retry, and, where a token would
  * help, a button to the panel's one token form instead of a form of its own.
@@ -36,16 +53,20 @@ export function GitHubErrorState({
   error,
   onRetry,
   compact = false,
+  withTokenForm = true,
 }: {
   error: unknown;
   onRetry: () => void;
   compact?: boolean;
+  /** Without a token form of its own: the panel's one shows where it would (`useErrorTokenReason`). */
+  withTokenForm?: boolean;
 }) {
   const t = usePluginTranslation('pull-requests');
   const { token, forget } = useGitHubToken();
-  const { via, connection, recheck } = useGitHubAccess();
+  const { via, connection, unreadable, recheck } = useGitHubAccess();
   const focusTokenForm = usePanelTokenFormFor(compact ? error : undefined);
   const message = useGitHubErrorMessage(error);
+  const reason = useErrorTokenReason(error);
   const hasToken = token !== undefined;
   const kind = error instanceof GitHubError ? error.kind : 'failed';
   const savedTokenNotFound = kind === 'notFound' && hasToken;
@@ -75,14 +96,19 @@ export function GitHubErrorState({
       </div>
     );
   }
+  const form = withTokenForm && reason ? <TokenForm reason={reason} /> : null;
   if (kind === 'failed') {
     return (
       <div>
         <p className="mrpr-status">{message}</p>
         {retry}
+        {form}
       </div>
     );
   }
+  // Any other answer without the token MindRoom cannot read says little, and asking again gets
+  // the same.
+  if (unreadable) return form && <div>{form}</div>;
   // MindRoom's connection has a token's limit: another token would not raise it.
   if (kind === 'rateLimited' && via !== undefined) {
     return (
@@ -109,15 +135,7 @@ export function GitHubErrorState({
           <RemoveServerToken />
         </p>
       ) : null}
-      <TokenForm
-        reason={
-          savedTokenNotFound
-            ? 'badToken'
-            : kind === 'badToken' && via === 'server'
-            ? 'override'
-            : kind
-        }
-      />
+      {form}
     </div>
   );
 }

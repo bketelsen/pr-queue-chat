@@ -111,11 +111,35 @@ describe('githubServer, a token saved in MindRoom', () => {
       body: { error: 'github_unreachable' },
     });
     for (const token of ['', 'ghp a', 'ghp\u0000a', 'a'.repeat(513)]) {
-      expect(await failure(server.request('/api/github/token', put(token)))).toMatchObject({
+      // As MindRoom answers any body it refuses: one code, nothing of what was sent.
+      expect(await failure(server.request('/api/github/token', put(token)))).toEqual({
         status: 422,
+        body: { error: 'github_request_invalid' },
       });
     }
     expect(storedToken()).toBeUndefined();
+  });
+
+  it('answers 503 github_token_unreadable while the saved token cannot be read, until another is saved or it is removed', async () => {
+    const unreadable = { status: 503, body: { error: 'github_token_unreadable' } };
+    const mindroom = githubServer(github);
+    await mindroom.server.request('/api/github/token', put('ghp_good'));
+    mindroom.unreadable(true);
+    expect(await failure(mindroom.server.request('/api/github/status'))).toEqual(unreadable);
+    expect(await failure(ask(mindroom.server, read))).toEqual(unreadable);
+    // A path MindRoom refuses is refused first, as it reads no token for it.
+    expect(await failure(ask(mindroom.server, { method: 'GET', path: '/user' }))).toMatchObject({
+      status: 400,
+    });
+    await mindroom.server.request('/api/github/token', put('ghp_good'));
+    expect(await ask(mindroom.server, read)).toMatchObject({ body: { auth: 'Bearer ghp_good' } });
+    mindroom.unreadable(true);
+    expect(await mindroom.server.request('/api/github/token', { method: 'DELETE' })).toEqual({
+      connected: true,
+      via: 'app',
+      login: 'octo',
+    });
+    expect(await mindroom.server.request('/api/github/status')).toMatchObject({ via: 'app' });
   });
 
   it('removes the token, again and again, answering the status after', async () => {
