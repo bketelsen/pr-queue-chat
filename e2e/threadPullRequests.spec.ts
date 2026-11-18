@@ -39,7 +39,8 @@ import { touch } from '@mindroom/e2e/touch';
 // requested when GitHub has not made it yet), with the header's controls on a phone; and without
 // a token, with the GitHub account connected in the room's MindRoom server (which the page also
 // answers), the chips, the panel and a merge go through that server, and the page asks GitHub
-// nothing itself.
+// nothing itself; and at a page zoom of 150 % the panel's text, its diffs and its file tree are
+// half again as large as at 100 %, where they keep their sizes.
 // Set MRPR_SHOTS=<directory> to save the screenshots of the pull request.
 
 const LINK_EVENT = 'com.mindroom.thread.pull_request';
@@ -915,6 +916,225 @@ test("a chip on a card opens the thread and its pull request; the banner's menu 
   await shot(page, 'thread-panel');
   expect(unanswered).toEqual([]);
   expect(warnings).toEqual([]);
+});
+
+// One changed file, so that the Code tab has a diff and a file tree.
+const ZOOM_FILE = {
+  filename: 'src/session/store.ts',
+  status: 'modified',
+  additions: 2,
+  deletions: 1,
+  sha: 'f'.repeat(40),
+  patch:
+    "@@ -1,2 +1,3 @@\n import { Redis } from 'ioredis';\n-export const store = new Map();\n+export const store = new Redis();\n+export const ttl = 3600;",
+};
+
+/** The font size of `locator`'s element, in px. */
+const fontSize = (locator: Locator) =>
+  locator.evaluate((element) => parseFloat(getComputedStyle(element).fontSize));
+/** The line height of `locator`'s element, in px. */
+const lineHeight = (locator: Locator) =>
+  locator.evaluate((element) => parseFloat(getComputedStyle(element).lineHeight));
+/** The height of `locator`'s element, in px to a hundredth. */
+const height = (locator: Locator) =>
+  locator.evaluate((element) => Math.round(element.getBoundingClientRect().height * 100) / 100);
+
+test("Page Zoom scales the panel's text, its diffs and its file tree", async ({ page }) => {
+  test.setTimeout(5 * 60_000);
+  const unanswered = await stubGitHub(page);
+  const [pull] = THREADS.sessions.pulls;
+  await page.route(
+    (url) => url.hostname === 'api.github.com' && url.pathname === `${pullPath(pull!)}/files`,
+    (route) => route.fulfill({ headers: CORS, json: [ZOOM_FILE] })
+  );
+  await openRoom(page);
+  /** The sizes at `pageZoom` percent, which the app sets as the root's font size. */
+  const sizes = async (pageZoom: number) => {
+    await page.evaluate((zoom) => {
+      const settings = JSON.parse(localStorage.getItem('settings') ?? '{}') as object;
+      localStorage.setItem('settings', JSON.stringify({ ...settings, pageZoom: zoom }));
+    }, pageZoom);
+    await page.goto(`/home/${encodeURIComponent(roomId)}`);
+    await expect(page.locator('html')).toHaveCSS('font-size', `${(16 * pageZoom) / 100}px`);
+    const cardChip = cardChips(page, roots.sessions).first();
+    await expect(cardChip).toBeVisible({ timeout: 120_000 });
+    const chip = await fontSize(cardChip);
+    await cardChip.click();
+    const title = panel(page).locator('.mrpr-panel-title');
+    await expect(title).toHaveText(pull!.title, { timeout: 30_000 });
+    const label = panel(page).locator('.mrpr-label').filter({ hasText: 'backend' });
+    await expect(label).toBeVisible({ timeout: 30_000 });
+    await shot(page, `zoom-${pageZoom}-summary`);
+    const text = {
+      cardChip: chip,
+      title: await fontSize(title),
+      label: await fontSize(label),
+    };
+    await panel(page).getByRole('tab', { name: 'Code' }).click();
+    // Pierre draws the diff and the tree in open shadow roots, which locators enter.
+    const line = panel(page).locator('[data-line]').filter({ hasText: 'ttl = 3600' }).first();
+    const row = panel(page).getByRole('treeitem', { name: 'store.ts' });
+    await expect(line).toBeVisible({ timeout: 30_000 });
+    await expect(row).toBeVisible();
+    await shot(page, `zoom-${pageZoom}-code`);
+    return {
+      ...text,
+      line: await fontSize(line),
+      lineHeight: await lineHeight(line),
+      row: await fontSize(row),
+      rowHeight: await height(row),
+    };
+  };
+  const normal = await sizes(100);
+  // At 100 % the sizes are those the plugin had in px.
+  expect(normal).toEqual({
+    cardChip: 10.4,
+    title: 16,
+    label: 11,
+    line: 13,
+    lineHeight: 20,
+    row: 12,
+    rowHeight: 24,
+  });
+  const zoomed = await sizes(150);
+  const scaled = Object.fromEntries(
+    Object.entries(normal).map(([name, value]) => [name, Math.round(value * 150) / 100])
+  );
+  expect(zoomed).toEqual(scaled);
+  expect(unanswered).toEqual([]);
+});
+
+// Enough files that the tree scrolls far past the rows it draws first, in two folders.
+const TREE_FILES = [
+  {
+    filename: 'docs/sessions.md',
+    status: 'added',
+    additions: 1,
+    deletions: 0,
+    patch: '@@ -0,0 +1 @@\n+# Sessions',
+  },
+  ...Array.from({ length: 60 }, (_, index) => ({
+    filename: `src/session/part-${String(index + 1).padStart(2, '0')}.ts`,
+    status: 'added',
+    additions: 1,
+    deletions: 0,
+    patch: '@@ -0,0 +1 @@\n+export {};',
+  })),
+].map((file, index) => ({ ...file, sha: String(index).padStart(40, '0') }));
+
+test('a pinch zoom keeps the file tree as it was: folded folders, selection, focus and scroll', async ({
+  page,
+}) => {
+  test.setTimeout(5 * 60_000);
+  // Tall enough that at 150 % the panel leaves the tree above the diffs its whole height.
+  await page.setViewportSize({ width: DESKTOP.width, height: 1300 });
+  const unanswered = await stubGitHub(page);
+  const [pull] = THREADS.sessions.pulls;
+  await page.route(
+    (url) => url.hostname === 'api.github.com' && url.pathname === `${pullPath(pull!)}/files`,
+    (route) => route.fulfill({ headers: CORS, json: TREE_FILES })
+  );
+  await openRoom(page);
+  await cardChips(page, roots.sessions).first().click();
+  await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(pull!.title, {
+    timeout: 30_000,
+  });
+  await panel(page).getByRole('tab', { name: 'Code' }).click();
+  const tree = panel(page).getByRole('tree');
+  /** Scrolls the tree to `top`, and waits until its rows take the pointer again. */
+  const scrollTree = async (top: number) => {
+    await tree.evaluate((element, to) => {
+      const root = element.getRootNode() as ShadowRoot;
+      root.querySelector('[data-file-tree-virtualized-scroll="true"]')!.scrollTop = to;
+    }, top);
+    await expect
+      .poll(() =>
+        tree.evaluate((element) =>
+          (element.getRootNode() as ShadowRoot).querySelector('[data-is-scrolling]')
+        )
+      )
+      .toBeNull();
+  };
+  const docs = tree.getByRole('treeitem', { name: 'docs' });
+  await docs.click();
+  await expect(docs).toHaveAttribute('aria-expanded', 'false');
+  // Scrolled down to a file the tree draws only there, which a click selects and focuses.
+  // Its row is the 52nd, past the 10 the tree shows and the 10 more it draws after them.
+  await scrollTree(49 * 24);
+  const file = tree.getByRole('treeitem', { name: 'part-50.ts' });
+  // With the focus on a row scrolled away, Pierre's first click only moves the focus.
+  await expect(async () => {
+    await file.click();
+    await expect(file).toHaveAttribute('aria-selected', 'true', { timeout: 1_000 });
+  }).toPass();
+  await expect(file).toBeFocused();
+
+  // The trees Pierre makes from here on.
+  await page.evaluate(() => {
+    const made = { count: 0 };
+    (window as unknown as { treesMade: typeof made }).treesMade = made;
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) continue;
+          made.count += node.matches('file-tree-container')
+            ? 1
+            : node.querySelectorAll('file-tree-container').length;
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  });
+  /** A pinch on a trackpad: Ctrl with the wheel, one event a frame, 50 points of zoom. */
+  const pinch = (deltaY: number) =>
+    page.evaluate(async (delta) => {
+      for (let step = 0; step < 25; step += 1) {
+        document.body.dispatchEvent(
+          new WheelEvent('wheel', { deltaY: delta, ctrlKey: true, bubbles: true, cancelable: true })
+        );
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+    }, deltaY);
+  const treesMade = () =>
+    page.evaluate(() => (window as unknown as { treesMade: { count: number } }).treesMade.count);
+  /** How far the tree is scrolled, in rows of `rowHeight`. */
+  const scrolledRows = (rowHeight: number) =>
+    tree.evaluate((element, height) => {
+      const root = element.getRootNode() as ShadowRoot;
+      return root.querySelector('[data-file-tree-virtualized-scroll="true"]')!.scrollTop / height;
+    }, rowHeight);
+  await pinch(-100);
+  await expect(page.locator('html')).toHaveCSS('font-size', '24px');
+  await expect(file).toHaveCSS('height', '36px');
+  // Made once, after the zoom rested, not on each of its frames.
+  expect(await treesMade()).toBe(1);
+  // Still scrolled to the file, which keeps the selection and the focus.
+  await expect(file).toBeInViewport();
+  await expect(file).toHaveAttribute('aria-selected', 'true');
+  await expect(file).toBeFocused();
+  // And at the top, the folder is still folded.
+  await scrollTree(0);
+  await expect(docs).toHaveAttribute('aria-expanded', 'false');
+  await expect(tree.getByRole('treeitem', { name: 'sessions.md' })).toHaveCount(0);
+
+  // Scrolled up from the focused file, below the rows shown but among those drawn, a pinch back
+  // to 100 % keeps the tree where it was scrolled, and the focus on the file.
+  await scrollTree(35 * 36);
+  await expect(file).not.toBeInViewport();
+  await expect(file).toBeFocused();
+  await pinch(100);
+  await expect(page.locator('html')).toHaveCSS('font-size', '16px');
+  await expect.poll(treesMade).toBe(2);
+  await expect(tree.getByRole('treeitem', { name: 'part-40.ts' })).toHaveCSS('height', '24px');
+  await expect.poll(() => scrolledRows(24)).toBe(35);
+  await expect(file).toBeFocused();
+
+  // The header's button keeps the focus too.
+  const fold = panel(page).locator('.mrpr-tree-header button');
+  await fold.focus();
+  await pinch(-100);
+  await expect.poll(treesMade).toBe(3);
+  await expect(fold).toBeFocused();
+  expect(unanswered).toEqual([]);
 });
 
 const hoverCard = (page: Page) => page.getByRole('tooltip');
