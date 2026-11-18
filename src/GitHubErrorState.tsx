@@ -1,17 +1,27 @@
 import { usePluginTranslation } from '@mindroom/client-sdk/core';
 import { GitHubError } from './github';
-import { TokenForm, useGitHubAccess, useGitHubToken, usePanelTokenFormFor } from './token';
+import {
+  RemoveServerToken,
+  TokenForm,
+  useGitHubAccess,
+  useGitHubToken,
+  usePanelTokenFormFor,
+} from './token';
 
 /** Why GitHub gave no answer, in one sentence, by the error and how GitHub is reached. */
 export function useGitHubErrorMessage(error: unknown): string {
   const t = usePluginTranslation('pull-requests');
-  const { via } = useGitHubAccess();
+  const { via, connection } = useGitHubAccess();
   const kind = error instanceof GitHubError ? error.kind : 'failed';
   const status = error instanceof GitHubError ? error.status : 0;
   if (kind === 'failed') {
     return status === 0 ? t('error.failed') : t('error.failedStatus', { status });
   }
   if (kind === 'notFound' && via === 'token') return t('error.notFoundWithToken');
+  if (via === 'server' && connection === 'token') {
+    if (kind === 'notFound') return t('error.notFoundWithServerToken');
+    if (kind === 'badToken') return t('error.badServerToken');
+  }
   if (kind === 'notFound' && via === 'server') return t('error.notFoundWithServer');
   if (kind === 'badToken' && via === 'server') return t('error.badConnection');
   return t(`error.${kind}`);
@@ -33,7 +43,7 @@ export function GitHubErrorState({
 }) {
   const t = usePluginTranslation('pull-requests');
   const { token, forget } = useGitHubToken();
-  const { via, recheck } = useGitHubAccess();
+  const { via, connection, recheck } = useGitHubAccess();
   const focusTokenForm = usePanelTokenFormFor(compact ? error : undefined);
   const message = useGitHubErrorMessage(error);
   const hasToken = token !== undefined;
@@ -90,6 +100,14 @@ export function GitHubErrorState({
         <button className="mrpr-button" type="button" onClick={forget}>
           {t('token.forget')}
         </button>
+      ) : null}
+      {/* The token saved in MindRoom comes before the App, and nothing loads while it fails. */}
+      {via === 'server' &&
+      connection === 'token' &&
+      (kind === 'badToken' || kind === 'notFound') ? (
+        <p className="mrpr-status">
+          <RemoveServerToken />
+        </p>
       ) : null}
       <TokenForm
         reason={
