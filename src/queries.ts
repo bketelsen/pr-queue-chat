@@ -21,6 +21,7 @@ import {
   fetchReviews,
   GitHubError,
   GitHubWriteError,
+  refused,
   type GitHubAuth,
   type PullRequest,
   type PullRequestRef,
@@ -36,7 +37,7 @@ const retry = (count: number, error: Error) =>
     : count < 2;
 
 // Two minutes keeps a panel's worth of requests inside the anonymous rate limit.
-const STALE_TIME = 120_000;
+export const STALE_TIME = 120_000;
 
 // GitHub's owners and repositories ignore case, so the keys do as well: a link written
 // `Acme/Repo` and one written `acme/repo` share what was read, and the refetch after a write
@@ -86,14 +87,36 @@ export async function refreshPullRequest(
   return shown.every((query) => query.state.status !== 'error');
 }
 
+type QueryState = { state: { data: unknown; error: unknown } };
+
+// What a pull request's query read before GitHub refused it, until a read works again: no answer,
+// also beside a later read that failed.
+const refusedData = new WeakSet<object>();
+
+/** Whether the query's answer is GitHub's refusal, or what it read before one. */
+export const isRefused = (query: { data: unknown; error: unknown }) =>
+  refused(query.error) || refusedData.has(query.data as object);
+
+/** For a refetch option: false after a refusal, so none asks again by itself (a new token does). */
+export const unlessRefused = (query: QueryState) => !isRefused(query.state);
+
+/** A query's answer: also the last one beside a read again that failed, none after a refusal. */
+export const answerOf = <T>(query: { data: T | undefined; error: unknown }) =>
+  isRefused(query) ? undefined : query.data;
+
 /** What a caller can change of a query's refetching: the chips leave out the refetch on window focus,
- * a thread's details also the one on mount, for an answer and for a refusal alike; `enabled: false`
- * reads only what is already there. */
+ * a thread's details also the one on mount, for an answer and for a refusal alike, and the banner's
+ * button with access adds an interval (`useBannerRefetch`); `enabled: false` reads only what is
+ * already there. */
 export type RefetchOptions = {
   enabled?: false;
-  refetchOnWindowFocus?: boolean;
-  refetchOnMount?: boolean;
+  refetchOnWindowFocus?: boolean | ((query: QueryState) => boolean);
+  refetchOnMount?: boolean | ((query: QueryState) => boolean);
+  refetchOnReconnect?: (query: QueryState) => boolean;
   retryOnMount?: boolean;
+  /** A pull request's query only: how often to read it again, per its answer (`query`). */
+  refetchInterval?: (query: QueryState) => number | false;
+  refetchIntervalInBackground?: boolean;
 };
 
 // A chip asks again when it shows after its answer went stale, not when the tab regains focus:
@@ -104,11 +127,20 @@ export const NO_FOCUS_REFETCH = { refetchOnWindowFocus: false };
 const pullRequestQuery = (
   ref: PullRequestRef | undefined,
   access: GitHubAccess,
-  options: RefetchOptions
+  options: RefetchOptions,
+  client: QueryClient
 ) => ({
   queryKey: keyOf(ref, access.key),
-  queryFn: ({ signal }: { signal: AbortSignal }) =>
-    fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal),
+  queryFn: ({ signal }: { signal: AbortSignal }) => {
+    const before = client.getQueryData<PullRequest>(keyOf(ref, access.key));
+    return fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal).then(
+      (pr) => (before && refusedData.delete(before), pr),
+      (error: unknown) => {
+        if (before && refused(error)) refusedData.add(before);
+        throw error;
+      }
+    );
+  },
   enabled: ref !== undefined && !access.pending,
   staleTime: STALE_TIME,
   retry,
@@ -116,7 +148,7 @@ const pullRequestQuery = (
 });
 
 export function usePullRequest(ref: PullRequestRef | undefined, options: RefetchOptions = {}) {
-  return useQuery(pullRequestQuery(ref, useGitHubAccess(), options));
+  return useQuery(pullRequestQuery(ref, useGitHubAccess(), options, useQueryClient()));
 }
 
 // GitHub computes whether a pull request merges after its base moved, in about a second; until
@@ -168,7 +200,8 @@ export function useMergeableRecheck(
 /** The pull requests `refs` as `usePullRequest` reads each, through the same queries. */
 export function usePullRequests(refs: readonly PullRequestRef[], options: RefetchOptions = {}) {
   const access = useGitHubAccess();
-  return useQueries({ queries: refs.map((ref) => pullRequestQuery(ref, access, options)) });
+  const client = useQueryClient();
+  return useQueries({ queries: refs.map((ref) => pullRequestQuery(ref, access, options, client)) });
 }
 
 export function usePullRequestFiles(ref: PullRequestRef | undefined, enabled: boolean) {

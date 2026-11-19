@@ -1,5 +1,10 @@
 // @vitest-environment jsdom
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
+  focusManager,
+  onlineManager,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query';
 import type { Room } from 'matrix-js-sdk';
 import { act } from 'react-dom/test-utils';
 import { renderPluginComponent } from '@mindroom/client-sdk/testing';
@@ -7,11 +12,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import plugin from './index';
 import { setShownPullRequest } from './shownPullRequest';
 import type { PullRequest } from './github';
-import { pullRequestKey } from './queries';
+import { pullRequestKey, usePullRequest } from './queries';
 import { trapOptions } from './testing/focusTrapStandIn';
 import { githubServer } from './testing/mindroomServer';
 import { linkedRoom, type TestLink, type TestWorktree } from './testing/linkedRoom';
 import { ThreadPullRequestsButton } from './ThreadPullRequestsButton';
+import { useGitHubToken } from './token';
 
 vi.mock('focus-trap-react', async () => ({
   default: (await import('./testing/focusTrapStandIn')).FocusTrapStandIn,
@@ -111,6 +117,9 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
 });
 afterEach(() => {
+  vi.useRealTimers();
+  focusManager.setFocused(undefined);
+  onlineManager.setOnline(true);
   vi.unstubAllGlobals();
 });
 
@@ -445,5 +454,271 @@ describe('ThreadPullRequestsButton', () => {
     expect(row?.getAttribute('href')).toBe('https://github.com/mindroom-ai/mindroom-chat/pull/7');
     expect(row?.getAttribute('target')).toBe('_blank');
     expect(row?.getAttribute('rel')).toBe('noreferrer');
+  });
+
+  describe('reading again what it shows', () => {
+    // Past the two minutes an answer stays fresh.
+    const STALE = 121_000;
+    const FIVE_MINUTES = 5 * 60_000;
+    // The page coming back: iOS resuming the app, or a tab shown again.
+    const comeBack = () =>
+      act(async () => {
+        window.dispatchEvent(new Event('visibilitychange'));
+      });
+    const later = (ms: number) => vi.setSystemTime(Date.now() + ms);
+    const states = (view: View) =>
+      [...view.baseElement.querySelectorAll('.mrpr-details-state')].map((node) => node.textContent);
+
+    it('with a token, reads an open pull request again when the page comes back after it went stale, and turns merged', async () => {
+      withToken();
+      vi.useFakeTimers({ toFake: ['Date'] });
+      serve({ 1: pull('open') });
+      const { view } = await show([{ number: 1 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      expect(pullRequestRequests()).toHaveLength(1);
+      serve({ 1: pull('merged') });
+      // While the answer is fresh, coming back asks nothing.
+      await comeBack();
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(pullRequestRequests()).toHaveLength(1);
+      later(STALE);
+      await comeBack();
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-merged'));
+      expect(pullRequestRequests()).toHaveLength(2);
+      expect(trigger(view).getAttribute('aria-label')).toBe('Pull request: Merged');
+    });
+
+    it('with a token, reads an open or draft pull request again every five minutes while the page shows, a merged one not', async () => {
+      withToken();
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      serve({ 1: pull('open', { draft: true }) });
+      const { view } = await show([{ number: 1 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-draft'));
+      serve({ 1: pull('open') });
+      await act(async () => vi.advanceTimersByTime(FIVE_MINUTES));
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      expect(pullRequestRequests()).toHaveLength(2);
+      // Hidden, as a backgrounded app: nothing is asked.
+      focusManager.setFocused(false);
+      serve({ 1: pull('merged') });
+      await act(async () => vi.advanceTimersByTime(FIVE_MINUTES));
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(pullRequestRequests()).toHaveLength(2);
+      focusManager.setFocused(true);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-merged'));
+      expect(pullRequestRequests()).toHaveLength(3);
+      // Merged is settled: no more polling.
+      await act(async () => vi.advanceTimersByTime(3 * FIVE_MINUTES));
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(pullRequestRequests()).toHaveLength(3);
+    });
+
+    it('with a token, its menu reads a stale answer again when it opens', async () => {
+      withToken();
+      vi.useFakeTimers({ toFake: ['Date'] });
+      serve({ 1: pull('open'), 2: pull('merged') });
+      const { view } = await show([{ number: 1 }, { number: 2 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      expect(pullRequestRequests()).toHaveLength(2);
+      serve({ 1: pull('merged'), 2: pull('merged') });
+      later(STALE);
+      await openMenu(view);
+      await vi.waitFor(() => expect(states(view)).toEqual(['Merged', 'Merged']));
+      expect(pullRequestRequests()).toHaveLength(4);
+      expect(tone(view)).toBe('mrpr-tone-merged');
+    });
+
+    it('with a token, its menu asks nothing again for a fresh answer', async () => {
+      withToken();
+      serve({ 1: pull('merged') });
+      const { view } = await show([{ number: 1 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-merged'));
+      await openMenu(view);
+      expect(states(view)).toEqual(['Merged']);
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(pullRequestRequests()).toHaveLength(1);
+    });
+
+    it('with a token, keeps the last answer of a pull request whose read again failed, until one works', async () => {
+      withToken();
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      serve({ 1: pull('open'), 2: pull('merged') });
+      const { view } = await show([{ number: 1 }, { number: 2 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      expect(pullRequestRequests()).toHaveLength(2);
+      const failing = (url: string) =>
+        /\/pulls\/1$/.test(url)
+          ? respond({ message: 'Bad Gateway' }, 502)
+          : respond(pull('merged'));
+      fetchMock.mockImplementation(async (url) => failing(url));
+      await act(async () => vi.advanceTimersByTime(FIVE_MINUTES));
+      // The read and its two tries again, a second and two apart.
+      await vi.waitFor(() => expect(pullRequestRequests()).toHaveLength(5), { timeout: 6_000 });
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(tone(view)).toBe('mrpr-tone-open');
+      expect(trigger(view).getAttribute('aria-label')).toBe('Pull requests (2): Open');
+      await openMenu(view);
+      const number = (row: HTMLElement) => row.querySelector('.mrpr-truncate')?.textContent;
+      expect(rows(view).map(number)).toEqual(['mindroom-chat #1', 'mindroom-chat #2']);
+      serve({ 1: pull('merged'), 2: pull('merged') });
+      await act(async () => vi.advanceTimersByTime(FIVE_MINUTES));
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-merged'), { timeout: 6_000 });
+      expect(states(view)).toEqual(['Merged', 'Merged']);
+    }, 15_000);
+
+    it('with a token, asks nothing again by itself after GitHub refused a pull request, until asked to', async () => {
+      withToken();
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      serve({ 1: pull('open') });
+      const { view } = await show([{ number: 1 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      serve({});
+      await act(async () => vi.advanceTimersByTime(FIVE_MINUTES));
+      await vi.waitFor(() => expect(tone(view)).toBeUndefined());
+      expect(pullRequestRequests()).toHaveLength(2);
+      const asked = fetchMock.mock.calls.length;
+      // Not on the next interval, nor when the page comes back, the window is focused or the network
+      // returns, nor when
+      // the menu opens stale, whose row shows no state and asks for no checks.
+      await act(async () => vi.advanceTimersByTime(FIVE_MINUTES));
+      later(STALE);
+      await comeBack();
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+      });
+      await openMenu(view);
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(states(view)).toEqual([]);
+      expect(fetchMock.mock.calls.length).toBe(asked);
+      // What asks again on purpose (a new token, Refresh) still does.
+      serve({ 1: pull('merged') });
+      await act(async () => client.invalidateQueries());
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-merged'));
+      expect(pullRequestRequests()).toHaveLength(3);
+    });
+
+    it('with a token, revives no answer from before a refusal when a read after it fails', async () => {
+      withToken();
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      serve({ 1: pull('open') });
+      const { view } = await show([{ number: 1 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      serve({});
+      await act(async () => vi.advanceTimersByTime(FIVE_MINUTES));
+      await vi.waitFor(() => expect(tone(view)).toBeUndefined());
+      // Refresh, and GitHub fails: the open pull request from before the refusal stays gone.
+      fetchMock.mockImplementation(async () => respond({ message: 'Bad Gateway' }, 502));
+      await act(async () => client.invalidateQueries());
+      await vi.waitFor(() => expect(pullRequestRequests()).toHaveLength(5), { timeout: 6_000 });
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(tone(view)).toBeUndefined();
+      await act(async () => vi.advanceTimersByTime(2 * FIVE_MINUTES));
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(pullRequestRequests()).toHaveLength(5);
+      serve({ 1: pull('open') });
+      await act(async () => client.invalidateQueries());
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+    }, 15_000);
+
+    it('with a token, reads again after a refused token is removed and a working one added', async () => {
+      withToken();
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      serve({ 1: pull('open') });
+      const tokens = { current: undefined as ReturnType<typeof useGitHubToken> | undefined };
+      const TokenForm = () => {
+        tokens.current = useGitHubToken();
+        return null;
+      };
+      const view = await renderPluginComponent(
+        <QueryClientProvider client={client}>
+          <TokenForm />
+          <div data-testid="slot">
+            <ThreadPullRequestsButton room={linkedRoom(ROOM_ID, [{ number: 1 }])} threadId="$t1" />
+          </div>
+        </QueryClientProvider>,
+        { id: 'pull-requests', plugin }
+      );
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      fetchMock.mockImplementation(async () => respond({ message: 'Bad credentials' }, 401));
+      await act(async () => vi.advanceTimersByTime(FIVE_MINUTES));
+      await vi.waitFor(() => expect(tone(view)).toBeUndefined());
+      await act(async () => tokens.current!.forget());
+      serve({ 1: pull('merged') });
+      await act(async () => tokens.current!.setToken('ghp_working'));
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-merged'));
+    });
+
+    it('keeps an anonymous refusal through a browser token set and removed, as the menu then asks nothing', async () => {
+      serve({ 1: pull('open') });
+      const tokens = { current: undefined as ReturnType<typeof useGitHubToken> | undefined };
+      const Chip = ({ shown }: { shown: boolean }) => {
+        tokens.current = useGitHubToken();
+        const ref = { owner: 'mindroom-ai', repo: 'mindroom-chat', number: 1 };
+        usePullRequest(shown ? ref : undefined);
+        return null;
+      };
+      const tree = (shown: boolean) => (
+        <QueryClientProvider client={client}>
+          <Chip shown={shown} />
+        </QueryClientProvider>
+      );
+      const chip = await renderPluginComponent(tree(true), { id: 'pull-requests', plugin });
+      const key = [
+        ...pullRequestKey({ owner: 'mindroom-ai', repo: 'mindroom-chat', number: 1 }),
+        false,
+      ];
+      await vi.waitFor(() => expect(client.getQueryData(key)).toBeDefined());
+      // Read again, refused: the query keeps the answer before beside the 404.
+      serve({});
+      await act(async () => client.invalidateQueries());
+      expect(client.getQueryState(key)?.status).toBe('error');
+      expect(pullRequestRequests()).toHaveLength(2);
+      chip.rerender(tree(false));
+      await act(async () => tokens.current!.setToken('ghp_test'));
+      await act(async () => tokens.current!.forget());
+      chip.unmount();
+      const { view } = await show([{ number: 1 }]);
+      await openMenu(view);
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(pullRequestRequests()).toHaveLength(2);
+    });
+
+    it('with a token, reads a stale answer again when the window is focused while the page shows', async () => {
+      withToken();
+      vi.useFakeTimers({ toFake: ['Date'] });
+      serve({ 1: pull('open') });
+      const { view } = await show([{ number: 1 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      serve({ 1: pull('merged') });
+      const focus = () =>
+        act(async () => {
+          window.dispatchEvent(new Event('focus'));
+        });
+      await focus();
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(pullRequestRequests()).toHaveLength(1);
+      later(STALE);
+      await focus();
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-merged'));
+      expect(pullRequestRequests()).toHaveLength(2);
+    });
+
+    it('without a token, asks nothing on mount, when the page comes back, on an interval or when the menu opens', async () => {
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      serve({ 1: pull('merged') });
+      readAnonymously(1, 'open');
+      const { view } = await show([{ number: 1 }]);
+      await vi.waitFor(() => expect(tone(view)).toBe('mrpr-tone-open'));
+      later(STALE);
+      await comeBack();
+      await act(async () => vi.advanceTimersByTime(3 * FIVE_MINUTES));
+      await openMenu(view);
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+      expect(states(view)).toEqual(['Open']);
+      expect(tone(view)).toBe('mrpr-tone-open');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
   });
 });

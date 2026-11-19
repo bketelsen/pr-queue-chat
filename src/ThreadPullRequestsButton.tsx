@@ -4,10 +4,13 @@
 // has no panel; the thread's worktree comes last, as an item that does nothing. The button's icon
 // and tone are its pull requests' state together, as T3 Code's thread badge. With a token or the
 // GitHub account connected in MindRoom it asks GitHub for each pull request no surface has loaded
-// yet (none for checks), once, refusals included; without either it asks nothing and goes by what
-// the chips and the menu's rows read.
+// yet (none for checks), a refusal once, and reads an answer again once it is two minutes old: when
+// the page shows again, every five minutes while the pull request is open or a draft, and when the
+// menu opens (`useBannerRefetch`); without either it asks nothing and goes by what the chips and the
+// menu's rows read.
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import FocusTrap from 'focus-trap-react';
+import { useQueryClient, type Query } from '@tanstack/react-query';
 import { IconButton, type RectCords } from 'folds';
 import { GitBranch, GitPullRequestArrow } from 'lucide-react';
 import {
@@ -23,9 +26,9 @@ import {
   resolvePullRequestState,
   type PullRequestStateKey,
 } from './presentation';
-import { usePullRequests } from './queries';
+import { answerOf, pullRequestKey, STALE_TIME, unlessRefused, usePullRequests } from './queries';
 import { useShownPullRequest } from './shownPullRequest';
-import { ANSWERED_ONLY, Details } from './ThreadDetails';
+import { Details, useBannerRefetch } from './ThreadDetails';
 import { useThreadPullRequests, type ThreadWorktree } from './threadPullRequests';
 import { pluginRootStyle } from './theme';
 import { RoomGitHub, useGitHubAccess } from './token';
@@ -58,13 +61,26 @@ function useCombinedState(pullRequests: readonly PullRequestRef[]) {
   const access = useGitHubAccess();
   const anonymous = access.via === undefined;
   const queries = usePullRequests(pullRequests, {
-    ...ANSWERED_ONLY,
+    ...useBannerRefetch(true),
     ...(anonymous && { enabled: false }),
   });
+  // TanStack hears the page shown again, not its window focused while shown: that reads here.
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    if (anonymous) return undefined;
+    const keys = pullRequests.map((ref) => JSON.stringify([...pullRequestKey(ref), access.key]));
+    const predicate = (query: Query) =>
+      keys.includes(query.queryHash) && unlessRefused(query) && query.isStaleByTime(STALE_TIME);
+    const focus = () => void queryClient.refetchQueries({ predicate }, { cancelRefetch: false });
+    window.addEventListener('focus', focus);
+    return () => window.removeEventListener('focus', focus);
+  }, [access.key, anonymous, pullRequests, queryClient]);
   // A refetch GitHub refused keeps the answer before beside the error: that one counts no more.
-  const answered = queries.flatMap((query) =>
-    query.status === 'success' ? [resolvePullRequestState(query.data).key] : []
-  );
+  // One that failed (no answer, an error of GitHub's, its rate limit) still does.
+  const answered = queries.flatMap((query) => {
+    const answer = answerOf(query);
+    return answer ? [resolvePullRequestState(answer).key] : [];
+  });
   const combined = combinedPullRequestState(answered);
   const loading = queries.some((query) => query.status === 'pending');
   // Until the room's MindRoom server says whether GitHub is connected there, what was read
@@ -244,6 +260,7 @@ function PullRequestsMenu({
                 worktree={worktree}
                 item={item}
                 className="mrpr-thread-menu-rows"
+                inBanner
               />
             </Menu>
           </FocusTrap>
