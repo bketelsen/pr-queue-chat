@@ -60,6 +60,28 @@ vi.mock('./CodeTab', async () => {
   };
 });
 
+// The room's controls of the panel, which the room's page gives; its Close is a spy.
+const panelControl = vi.hoisted(() => ({ close: undefined as (() => void) | undefined }));
+vi.mock('@mindroom/client-sdk/core', async (importOriginal) => {
+  const core = await importOriginal<typeof import('@mindroom/client-sdk/core')>();
+  return {
+    ...core,
+    // The real hook runs on every render, so a test that sets or clears the spy while a panel
+    // is mounted keeps the same hooks.
+    useRoomSidePanel: (pluginId: string, panelId: string) => {
+      const room = core.useRoomSidePanel(pluginId, panelId);
+      return panelControl.close
+        ? {
+            isOpen: true,
+            open: () => undefined,
+            openBesideThread: () => undefined,
+            close: panelControl.close,
+          }
+        : room;
+    },
+  };
+});
+
 // The app's Markdown renderer loads on demand and cannot load here; this one renders bold text.
 vi.mock('@mindroom/client-sdk/ui', async (importOriginal) => {
   const ui = await importOriginal<typeof import('@mindroom/client-sdk/ui')>();
@@ -145,6 +167,54 @@ afterEach(() => {
   roomServer.current = undefined;
 });
 
+// The observers the panel made, so a test can report the header in or out of view and the top
+// row's new height.
+let observers: {
+  callback: IntersectionObserverCallback;
+  options?: IntersectionObserverInit;
+  targets: Element[];
+}[] = [];
+let resized: ResizeObserverCallback[] = [];
+const stubObservers = () => {
+  observers = [];
+  resized = [];
+  vi.stubGlobal(
+    'IntersectionObserver',
+    class {
+      targets: Element[] = [];
+      constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+        observers.push({ callback, options, targets: this.targets });
+      }
+      observe(target: Element) {
+        this.targets.push(target);
+      }
+      disconnect() {
+        this.targets.splice(0);
+      }
+    }
+  );
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      constructor(callback: ResizeObserverCallback) {
+        resized.push(callback);
+      }
+      observe() {}
+      disconnect() {}
+    }
+  );
+};
+const report = (inView: boolean) =>
+  act(async () => {
+    for (const { callback, targets } of observers) {
+      if (targets.length === 0) continue;
+      callback(
+        targets.map((target) => ({ target, isIntersecting: inView } as IntersectionObserverEntry)),
+        {} as IntersectionObserver
+      );
+    }
+  });
+
 const EMPTY = 'Click a pull request link in a message to show it here.';
 
 describe('PullRequestPanel', () => {
@@ -217,7 +287,8 @@ describe('PullRequestPanel', () => {
     expect(view.getByText('-2')).toBeTruthy();
     expect(view.getByText('3 files')).toBeTruthy();
     expect(view.getByText(/updated 2 days ago/)).toBeTruthy();
-    expect(view.getByText('Open on GitHub').closest('a')?.getAttribute('href')).toBe(
+    // The number opens it on GitHub; Open on GitHub itself is in More actions.
+    expect(view.getByText('#200').closest('a')?.getAttribute('href')).toBe(
       'https://github.com/mindroom-ai/mindroom-chat/pull/200'
     );
   });
@@ -296,8 +367,15 @@ describe('PullRequestPanel', () => {
     });
     await click(view.getByRole('button', { name: 'Save' }));
     await view.findByText('Add pull request cards');
-    await click(view.getByRole('button', { name: 'Forget token' }));
-    await vi.waitFor(() => expect(view.queryByRole('button', { name: 'Forget token' })).toBeNull());
+    // In More actions, as the token's other entries.
+    await click(view.getByRole('button', { name: 'More actions' }));
+    await click(view.getByRole('menuitem', { name: 'Forget token' }));
+    // The pull request reads again without it.
+    await click(await view.findByRole('button', { name: 'More actions' }));
+    await vi.waitFor(() =>
+      expect(view.queryByRole('menuitem', { name: 'Forget token' })).toBeNull()
+    );
+    expect(view.getByRole('menuitem', { name: 'Open on GitHub' })).toBeTruthy();
   });
 
   it('asks GitHub for 7 requests for the header and Summary, then one per tab', async () => {
@@ -361,7 +439,8 @@ describe('PullRequestPanel', () => {
     const view = await show();
     expect(await view.findByText('No comments yet.')).toBeTruthy();
     expect(await view.findByText('No checks')).toBeTruthy();
-    expect(view.getByText('None')).toBeTruthy();
+    // No reviewers, so no row that says so.
+    expect(view.queryByText('Reviewers')).toBeNull();
     expect(paths()).toEqual([...summary].sort());
 
     await click(view.getByRole('tab', { name: 'Timeline' }));
@@ -430,23 +509,13 @@ describe('PullRequestPanel', () => {
       expect(link.getAttribute('href')).toBe('https://github.com/basnijholt');
     });
 
-    it('copies the checkout command', async () => {
-      const writeText = vi.fn(async () => undefined);
-      vi.stubGlobal('navigator', { clipboard: { writeText } });
-      const view = await show();
-      // Its name, which its tooltip shows too, says what it copies.
-      const COPY = 'Copy checkout command: gh pr checkout 200 -R mindroom-ai/mindroom-chat';
-      await click(await view.findByRole('button', { name: COPY }));
-      expect(writeText).toHaveBeenCalledWith('gh pr checkout 200 -R mindroom-ai/mindroom-chat');
-      expect(view.getByRole('button', { name: 'Copied' })).toBeTruthy();
-    });
-
-    it('leaves the checkout button as it was where there is no clipboard', async () => {
+    it('leaves Copy checkout command as it was where there is no clipboard', async () => {
       vi.stubGlobal('navigator', {});
       const view = await show();
-      await click(await view.findByRole('button', { name: /^Copy checkout command: / }));
-      expect(view.getByRole('button', { name: /^Copy checkout command: / })).toBeTruthy();
-      expect(view.queryByRole('button', { name: 'Copied' })).toBeNull();
+      await click(await view.findByRole('button', { name: 'More actions' }));
+      await click(view.getByRole('menuitem', { name: 'Copy checkout command' }));
+      expect(view.getByRole('menuitem', { name: 'Copy checkout command' })).toBeTruthy();
+      expect(view.queryByRole('menuitem', { name: 'Copied' })).toBeNull();
     });
 
     it('names the owner of a fork head', async () => {
@@ -792,17 +861,16 @@ describe('PullRequestPanel', () => {
 
   describe('header actions', () => {
     const GRAPHQL = 'https://api.github.com/graphql';
-    const headerRow = (view: Awaited<ReturnType<typeof show>>) =>
-      view.container.querySelector<HTMLElement>('.mrpr-header-actions');
 
-    it("shows today's header row without a token, and asks GitHub no GraphQL", async () => {
+    it('offers no action without a token, only the menu, and asks GitHub no GraphQL', async () => {
       const view = await show();
       await view.findByText('Add pull request cards');
-      const row = headerRow(view);
-      expect(Array.from(row?.children ?? []).map((child) => child.textContent)).toEqual([
-        'Open on GitHub',
+      await click(view.getByRole('button', { name: 'More actions' }));
+      expect(view.getAllByRole('menuitem').map((item) => item.getAttribute('aria-live'))).toEqual([
+        null,
+        'polite',
       ]);
-      expect(view.queryByRole('button', { name: 'More actions' })).toBeNull();
+      expect(view.getByRole('menuitem', { name: 'Open on GitHub' })).toBeTruthy();
       expect(view.queryByRole('button', { name: 'Merge' })).toBeNull();
       expect(fetchMock.mock.calls.filter(([url]) => url === GRAPHQL)).toEqual([]);
     });
@@ -831,7 +899,6 @@ describe('PullRequestPanel', () => {
       expect(await view.findByRole('button', { name: 'More actions' })).toBeTruthy();
       expect(view.getAllByText('Merged')).toHaveLength(1);
       expect(view.queryByRole('button', { name: 'Merge' })).toBeNull();
-      expect(headerRow(view)?.textContent).toContain('Open on GitHub');
     });
 
     // As T3 Code: only a branch GitHub found mergeable, not one it is still computing (null).
@@ -990,7 +1057,8 @@ describe('with the GitHub account connected in MindRoom', () => {
     // Nothing went to GitHub from the browser, and the status was asked once.
     expect(fetchMock).not.toHaveBeenCalled();
     expect(mindroom.statusRequests()).toBe(1);
-    expect(view.queryByRole('button', { name: 'Forget token' })).toBeNull();
+    await toggleMore(view);
+    expect(view.queryByRole('menuitem', { name: 'Forget token' })).toBeNull();
   });
 
   it('keeps who it goes as in More actions also for a viewer who cannot write', async () => {
@@ -1031,6 +1099,32 @@ describe('with the GitHub account connected in MindRoom', () => {
     // The entry went with the menu: the focus goes back to the button that opened it.
     const more = view.getByRole('button', { name: 'More actions' });
     await waitUntil(() => expect(document.activeElement).toBe(more));
+  });
+
+  it('does not collapse while a failed removal from the menu says so', async () => {
+    stubObservers();
+    const mindroom = githubServer(withUser);
+    await saveInMindroom(mindroom);
+    const real = mindroom.server.request.getMockImplementation()!;
+    mindroom.server.request.mockImplementation(async (path, init) => {
+      if (path === '/api/github/token' && init?.method === 'DELETE') {
+        throw new MindroomServerError('Forbidden', 403, {});
+      }
+      return real(path, init);
+    });
+    roomServer.current = mindroom.server;
+    const view = await show();
+    await view.findByRole('button', { name: 'More actions' });
+    await report(false);
+    expect(view.getByRole('button', { name: /^Show details of pull request/ })).toBeTruthy();
+    await choose(view, 'Remove token from MindRoom');
+    await view.findByText('MindRoom could not remove the token.');
+    // The header comes back with the line, and stays while it shows.
+    expect(view.queryByRole('button', { name: /^Show details of pull request/ })).toBeNull();
+    await report(false);
+    expect(view.queryByRole('button', { name: /^Show details of pull request/ })).toBeNull();
+    // The same box still scrolls the panel, the header with it.
+    expect(view.container.querySelector('.mrpr-panel-scrolls')).toBeTruthy();
   });
 
   it('says a removal from the menu failed on a line of its own, until a token is saved again', async () => {
@@ -1082,6 +1176,32 @@ describe('with the GitHub account connected in MindRoom', () => {
     } finally {
       elsewhere.remove();
     }
+  });
+
+  it('gives the focus from the bar to the number when a failed removal brings the header back', async () => {
+    stubObservers();
+    const mindroom = githubServer(withUser);
+    await saveInMindroom(mindroom);
+    let fail!: () => void;
+    const held = new Promise<void>((resolve) => (fail = resolve));
+    const real = mindroom.server.request.getMockImplementation()!;
+    mindroom.server.request.mockImplementation(async (path, init) => {
+      if (path === '/api/github/token' && init?.method === 'DELETE') {
+        await held;
+        throw new MindroomServerError('Forbidden', 403, {});
+      }
+      return real(path, init);
+    });
+    roomServer.current = mindroom.server;
+    const view = await show();
+    await view.findByRole('button', { name: 'More actions' });
+    await choose(view, 'Remove token from MindRoom');
+    await report(false);
+    act(() => view.getByRole('button', { name: /^Show details of pull request/ }).focus());
+    await act(async () => fail());
+    await view.findByText('MindRoom could not remove the token.');
+    expect(view.queryByRole('button', { name: /^Show details of pull request/ })).toBeNull();
+    expect(document.activeElement).toBe(view.getByRole('link', { name: '#200' }));
   });
 
   describe('while GitHub still checks whether it merges', () => {
@@ -1204,9 +1324,11 @@ describe('with the GitHub account connected in MindRoom', () => {
       await settle(() => expect(reads).toBe(2));
       await later(10_000);
       expect(reads).toBe(2);
-      expect(more.getAttribute('aria-disabled')).toBe('true');
+      // The action runs until its read is in.
+      const running = () => view.queryByText('Closing...');
+      expect(running()).toBeTruthy();
       await act(async () => release(respond(pull({ state: 'closed' }))));
-      await settle(() => expect(more.getAttribute('aria-disabled')).toBeNull());
+      await settle(() => expect(running()).toBeNull());
     });
 
     it('reads nothing again once the panel is gone', async () => {
@@ -1249,9 +1371,10 @@ describe('with the GitHub account connected in MindRoom', () => {
     });
     await click(view.getByLabelText('Only this browser'));
     await click(view.getByRole('button', { name: 'Save' }));
-    await waitUntil(() => expect(view.getByRole('button', { name: 'Forget token' })).toBeTruthy());
-    expect(view.queryByText(/through MindRoom/)).toBeNull();
     await toggleMore(view);
+    await waitUntil(() =>
+      expect(view.getByRole('menuitem', { name: 'Forget token' })).toBeTruthy()
+    );
     expect(view.queryByText(/through MindRoom/)).toBeNull();
     expect(view.queryByText('Use a token in this browser')).toBeNull();
     await waitUntil(() => expect(fetchMock).toHaveBeenCalled());
@@ -1333,7 +1456,8 @@ describe('with the GitHub account connected in MindRoom', () => {
     expect(await view.findByRole('button', { name: 'Merge' })).toBeTruthy();
     expect(mindroom.server.request).not.toHaveBeenCalled();
     expect(view.queryByText(/through MindRoom/)).toBeNull();
-    expect(view.getByRole('button', { name: 'Forget token' })).toBeTruthy();
+    await toggleMore(view);
+    expect(view.getByRole('menuitem', { name: 'Forget token' })).toBeTruthy();
   });
 
   it('reads without either and offers no writes while MindRoom has no GitHub connected', async () => {
@@ -2079,5 +2203,273 @@ describe('with the GitHub account connected in MindRoom', () => {
       )
     );
     expect(mindroom.storedToken()).toBe('ghp_good');
+  });
+});
+
+describe('the dense header', () => {
+  const GRAPHQL = 'https://api.github.com/graphql';
+  const head = { ref: 'feature', sha: 'abc123', repo: { full_name: 'mindroom-ai/mindroom-chat' } };
+  const repository = {
+    viewerPermission: 'WRITE',
+    mergeCommitAllowed: true,
+    squashMergeAllowed: false,
+    rebaseMergeAllowed: false,
+    autoMergeAllowed: false,
+    defaultBranchRef: { name: 'main' },
+  };
+  // A writer's panel, whose merge GitHub refuses unless `merges`.
+  const asWriter = (over: Record<string, unknown> = {}, merges = false) => {
+    localStorage.setItem(
+      'mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/githubToken',
+      'tok'
+    );
+    fetchMock.mockImplementation(async (url) => {
+      if (url === GRAPHQL) return respond({ data: { repository } });
+      if (url.includes('/merge'))
+        return merges
+          ? respond({ merged: true })
+          : respond({ message: 'Base branch was modified' }, 405);
+      if (url.includes('/compare/')) return respond({ behind_by: 0 });
+      if (url.includes('/check-runs')) return respond({ check_runs: [] });
+      if (url.includes('/status?')) return respond({ statuses: [] });
+      if (url.includes('/files') || url.includes('/commits') || url.includes('/comments'))
+        return respond([]);
+      if (url.includes('/reviews')) return respond([]);
+      return respond(pull({ node_id: 'PR_kw200', head, mergeable: true, ...over }));
+    });
+  };
+
+  beforeEach(stubObservers);
+  afterEach(() => {
+    panelControl.close = undefined;
+  });
+  beforeEach(() => {
+    panelControl.close = vi.fn();
+  });
+  // The panel in a box that scrolls, as the room's panel box does.
+  const showScrolling = async () => {
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return renderPluginComponent(
+      <div data-testid="scroller" style={{ overflowY: 'auto' }}>
+        <QueryClientProvider client={client}>
+          <PullRequestPanel roomId="!room:example.org" request={REQUEST} />
+        </QueryClientProvider>
+      </div>,
+      { id: 'pull-requests', plugin }
+    );
+  };
+  // Its name says what it does and which pull request it shows.
+  const bar = 'Show details of pull request #200: Add pull request cards';
+
+  it('puts the crumbs with More actions and Close, the title, the meta and the branches in that order', async () => {
+    asWriter();
+    const view = await show();
+    const title = await view.findByRole('heading', { level: 2, name: 'Add pull request cards' });
+    await view.findByRole('button', { name: 'Merge' });
+    const crumbs = view.container.querySelector<HTMLElement>('.mrpr-crumbs');
+    const parts = Array.from(crumbs?.querySelectorAll('a, button') ?? []).map(
+      (part) => part.getAttribute('aria-label') ?? part.textContent
+    );
+    expect(parts).toEqual([
+      'mindroom-ai/mindroom-chat',
+      '#200',
+      'More actions',
+      'Close pull request panel',
+    ]);
+    const meta = view.container.querySelector<HTMLElement>('.mrpr-panel-meta');
+    expect(meta?.textContent).toMatch(/^Bbasnijholt·updated 2 days ago.*3 files.*\+10.*-2/);
+    const branches = view.container.querySelector<HTMLElement>('.mrpr-branches');
+    expect(branches?.textContent).toMatch(/^main.*feature.*Merge$/);
+    const order = [crumbs, title, meta, branches] as HTMLElement[];
+    order.slice(1).forEach((part, index) => {
+      expect(order[index]?.compareDocumentPosition(part)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+    // The rows of before are gone: no copy button, no Open on GitHub link.
+    expect(view.container.querySelector('.mrpr-header-actions')).toBeNull();
+    expect(view.queryByRole('link', { name: 'Open on GitHub' })).toBeNull();
+    expect(view.queryByRole('button', { name: /^Copy checkout command/ })).toBeNull();
+  });
+
+  it('keeps Copy checkout command and Open on GitHub in More actions, also without a token', async () => {
+    const writeText = vi.fn(async () => undefined);
+    const open = vi.fn();
+    vi.stubGlobal('navigator', { clipboard: { writeText } });
+    vi.stubGlobal('open', open);
+    const view = await show();
+    await click(await view.findByRole('button', { name: 'More actions' }));
+    await click(view.getByRole('menuitem', { name: 'Open on GitHub' }));
+    expect(open).toHaveBeenCalledWith(
+      'https://github.com/mindroom-ai/mindroom-chat/pull/200',
+      '_blank',
+      'noopener,noreferrer'
+    );
+    await click(view.getByRole('button', { name: 'More actions' }));
+    await click(view.getByRole('menuitem', { name: 'Copy checkout command' }));
+    expect(writeText).toHaveBeenCalledWith('gh pr checkout 200 -R mindroom-ai/mindroom-chat');
+    // The entry says so, to a screen reader too, and the menu stays open meanwhile.
+    const copied = await view.findByRole('menuitem', { name: 'Copied' });
+    expect(copied.getAttribute('aria-live')).toBe('polite');
+  });
+
+  it('closes the panel with its Close', async () => {
+    const close = vi.fn();
+    panelControl.close = close;
+    const view = await show();
+    await view.findByText('Add pull request cards');
+    await click(view.getByRole('button', { name: 'Close pull request panel' }));
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('can be closed while the pull request loads', async () => {
+    const close = vi.fn();
+    panelControl.close = close;
+    fetchMock.mockImplementation(() => new Promise<Response>(() => undefined));
+    const view = await show();
+    expect(view.getByText('Loading pull request')).toBeTruthy();
+    await click(view.getByRole('button', { name: 'Close pull request panel' }));
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a bar that scrolls back to the top once the header is out of view', async () => {
+    const view = await showScrolling();
+    await view.findByText('Add pull request cards');
+    const scroller = view.getByTestId('scroller');
+    const scrollTo = vi.fn();
+    scroller.scrollTo = scrollTo as typeof scroller.scrollTo;
+    expect(view.queryByRole('button', { name: bar })).toBeNull();
+    // The observer watches the header against the box that scrolls.
+    expect(observers.at(-1)?.targets).toEqual([view.container.querySelector('.mrpr-header')]);
+    await report(false);
+    const button = view.getByRole('button', { name: bar });
+    expect(button.textContent).toBe('#200Add pull request cards');
+    await click(button);
+    expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({ top: 0 }));
+    await report(true);
+    expect(view.queryByRole('button', { name: bar })).toBeNull();
+    expect(view.getByText('mindroom-ai/mindroom-chat')).toBeTruthy();
+  });
+
+  it('keeps the focus on the number as the top row turns into the bar and back', async () => {
+    const view = await showScrolling();
+    await view.findByText('Add pull request cards');
+    const number = () => view.getByRole('link', { name: '#200' });
+    act(() => number().focus());
+    await report(false);
+    expect(document.activeElement).toBe(view.getByRole('button', { name: bar }));
+    await report(true);
+    expect(document.activeElement).toBe(number());
+    // What stays in the row keeps its focus, and focus elsewhere stays where it is.
+    act(() => view.getByRole('button', { name: 'More actions' }).focus());
+    await report(false);
+    expect(document.activeElement).toBe(view.getByRole('button', { name: 'More actions' }));
+    act(() => view.getByRole('tab', { name: 'Summary' }).focus());
+    await report(true);
+    expect(document.activeElement).toBe(view.getByRole('tab', { name: 'Summary' }));
+  });
+
+  it("watches the header again under the top row's new height", async () => {
+    const view = await showScrolling();
+    await view.findByText('Add pull request cards');
+    const bar = view.container.querySelector('.mrpr-bar') as Element;
+    await act(async () => {
+      for (const callback of resized) {
+        callback(
+          [{ target: bar, contentRect: { height: 60 } } as unknown as ResizeObserverEntry],
+          {} as ResizeObserver
+        );
+      }
+    });
+    const watching = observers.filter(({ targets }) => targets.length > 0);
+    expect(watching.map(({ options }) => options?.rootMargin)).toEqual(['-60px 0px 0px 0px']);
+  });
+
+  it("stays collapsed, the focus where it was, as the top row's height changes", async () => {
+    const view = await showScrolling();
+    await view.findByText('Add pull request cards');
+    await report(false);
+    const details = view.getByRole('button', { name: bar });
+    act(() => details.focus());
+    const row = view.container.querySelector('.mrpr-bar') as Element;
+    await act(async () => {
+      for (const callback of resized) {
+        callback(
+          [{ target: row, contentRect: { height: 60 } } as unknown as ResizeObserverEntry],
+          {} as ResizeObserver
+        );
+      }
+    });
+    expect(view.getByRole('button', { name: bar })).toBe(details);
+    expect(document.activeElement).toBe(details);
+  });
+
+  it('does not collapse on the Code tab, which scrolls itself', async () => {
+    const view = await showScrolling();
+    await view.findByText('Add pull request cards');
+    await click(view.getByRole('tab', { name: 'Code' }));
+    await report(false);
+    expect(view.queryByRole('button', { name: bar })).toBeNull();
+  });
+
+  it('does not collapse while the result of an action shows', async () => {
+    asWriter();
+    const view = await showScrolling();
+    const scroller = view.getByTestId('scroller');
+    const scrollTo = vi.fn();
+    scroller.scrollTo = scrollTo as typeof scroller.scrollTo;
+    await view.findByRole('button', { name: 'Merge' });
+    await report(false);
+    expect(view.getByRole('button', { name: bar })).toBeTruthy();
+    await click(view.getByRole('button', { name: 'Merge' }));
+    await click(await view.findByRole('button', { name: 'Confirm merge?' }));
+    expect(await view.findByText(/Base branch was modified/)).toBeTruthy();
+    // The panel scrolls as before, in the same box, which brings the header and its line back.
+    expect(view.container.querySelector('.mrpr-panel-scrolls')).toBeTruthy();
+    expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({ top: 0 }));
+    await report(false);
+    expect(view.queryByRole('button', { name: bar })).toBeNull();
+    await click(view.getByRole('button', { name: 'Dismiss' }));
+    await report(false);
+    expect(view.getByRole('button', { name: bar })).toBeTruthy();
+  });
+
+  it.each([
+    ['out of view', -40, 1],
+    ['in view', 300, 0],
+  ])(
+    'brings back the header %s when a line comes while an action holds it',
+    async (_where, bottom, reveals) => {
+      asWriter();
+      // The merge answers when the test lets it.
+      let answer!: () => void;
+      const answered = new Promise<void>((resolve) => (answer = resolve));
+      const writer = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url, init) => {
+        if (url.includes('/merge')) await answered;
+        return writer(url, init);
+      });
+      const view = await showScrolling();
+      const scroller = view.getByTestId('scroller');
+      const scrollTo = vi.fn();
+      scroller.scrollTo = scrollTo as typeof scroller.scrollTo;
+      // Started at the top, then scrolled while the merge runs.
+      await click(await view.findByRole('button', { name: 'Merge' }));
+      await click(await view.findByRole('button', { name: 'Confirm merge?' }));
+      const header = view.container.querySelector('.mrpr-header') as HTMLElement;
+      header.getBoundingClientRect = () => ({ top: bottom - 200, bottom } as DOMRect);
+      scrollTo.mockClear();
+      await act(async () => answer());
+      expect(await view.findByText(/Base branch was modified/)).toBeTruthy();
+      expect(scrollTo).toHaveBeenCalledTimes(reveals);
+      if (reveals) expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({ top: 0 }));
+    }
+  );
+
+  it('has no button on the branch line of a merged pull request', async () => {
+    asWriter({ state: 'closed', merged_at: '2026-11-02T00:00:00Z' });
+    const view = await show();
+    await view.findByRole('button', { name: 'More actions' });
+    const branches = view.container.querySelector<HTMLElement>('.mrpr-branches');
+    expect(branches?.textContent).toMatch(/^main.*feature$/);
+    expect(branches?.querySelector('button')).toBeNull();
   });
 });

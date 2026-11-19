@@ -5,7 +5,7 @@ import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PullRequest, PullRequestRef } from '../github';
 import plugin from '../index';
-import { HeaderActions } from './HeaderActions';
+import { useHeaderActions } from './HeaderActions';
 import {
   resetPullRequestActions,
   usePullRequestActions,
@@ -115,6 +115,22 @@ const answerHeld = async () => {
 
 let writeAnswer: () => Promise<Response>;
 
+/** The header's three parts in a row, as the panel places them in its rows. */
+function HeaderActions(props: Omit<Parameters<typeof useHeaderActions>[0], 'checkout'>) {
+  const { control, menu, lines, holds } = useHeaderActions({
+    ...props,
+    checkout: 'gh pr checkout 7',
+  });
+  return (
+    <>
+      <span data-testid="holds">{String(holds)}</span>
+      {control}
+      {menu}
+      {lines}
+    </>
+  );
+}
+
 function Harness({ pullRequest }: { pullRequest: PullRequest }) {
   const actions = usePullRequestActions(ref, pullRequest);
   return (
@@ -141,9 +157,13 @@ const row = (view: View, name: string) => {
   return button;
 };
 const moreActions = (view: View) => view.getByRole('button', { name: 'More actions' });
+// What the menu holds for everyone: Copy checkout command shows its command under it.
+const ALWAYS = ['Open on GitHub', 'Copy checkout commandgh pr checkout 7'];
+// The menu shows before the repository's access is in, with Open on GitHub and Copy checkout
+// command alone; the actions, and Refresh, join it once it is.
 const openMenu = async (view: View) => {
-  await waitUntil(() => expect(moreActions(view)).toBeTruthy());
   await click(moreActions(view));
+  await waitUntil(() => expect(view.getByText('Refresh')).toBeTruthy());
 };
 
 beforeEach(() => {
@@ -184,16 +204,24 @@ afterEach(async () => {
 });
 
 describe('HeaderActions', () => {
-  it('draws nothing without a token, and asks GitHub nothing', async () => {
+  // The menu's button alone, whose menu holds what applies without a write.
+  const onlyTheMenu = async (view: View) => {
+    const buttons = Array.from(view.getByTestId('header-row').querySelectorAll('button'));
+    expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual(['More actions']);
+    await click(moreActions(view));
+    expect(view.getAllByRole('menuitem').map((item) => item.textContent)).toEqual(ALWAYS);
+  };
+
+  it('has only the menu without a token, and asks GitHub nothing', async () => {
     localStorage.clear();
     const view = await show();
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
-    expect(view.getByTestId('header-row').innerHTML).toBe('');
+    await onlyTheMenu(view);
     expect(graphqlRequests()).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('draws nothing on a repository the viewer can only read', async () => {
+  it('has only the menu on a repository the viewer can only read', async () => {
     repository = { ...repository, viewerPermission: 'READ' };
     const view = await show();
     await waitUntil(() =>
@@ -201,7 +229,7 @@ describe('HeaderActions', () => {
         canWrite: false,
       })
     );
-    expect(view.getByTestId('header-row').innerHTML).toBe('');
+    await onlyTheMenu(view);
     expect(fetchMock.mock.calls.filter(([url]) => url.includes('/check-runs'))).toEqual([]);
   });
 
@@ -328,6 +356,7 @@ describe('HeaderActions', () => {
       'Enable auto-merge',
       'Convert to draft',
       'Close pull request',
+      ...ALWAYS,
       'Refresh',
     ]);
   });
@@ -345,6 +374,7 @@ describe('HeaderActions', () => {
     expect(view.getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
       'Convert to draft',
       'Close pull request',
+      ...ALWAYS,
       'Refresh',
     ]);
   });
@@ -450,7 +480,10 @@ describe('HeaderActions', () => {
       expect(fetchMock.mock.calls.some(([url, init]) => isHeadBranchQuery(url, init))).toBe(true)
     );
     await openMenu(view);
-    expect(view.getAllByRole('menuitem').map((item) => item.textContent)).toEqual(['Refresh']);
+    expect(view.getAllByRole('menuitem').map((item) => item.textContent)).toEqual([
+      ...ALWAYS,
+      'Refresh',
+    ]);
   });
 
   it('leaves a branch that got commits after the menu was drawn, and says so', async () => {
@@ -491,10 +524,10 @@ describe('HeaderActions', () => {
 
   // The header with an outcome the runner left, on the pull request as the panel has it.
   const dismissResult = vi.fn();
-  const withResult = (result: ActionResult, pullRequest: PullRequest) => {
+  const withResult = (result: ActionResult, pullRequest: PullRequest, canWrite = true) => {
     const actions = {
       repo: {
-        canWrite: true,
+        canWrite,
         mergeMethods: ['merge' as const],
         autoMergeAllowed: false,
         defaultBranch: 'main',
@@ -512,6 +545,23 @@ describe('HeaderActions', () => {
       </QueryClientProvider>
     );
   };
+
+  it('holds the header in place only while its line shows the outcome', async () => {
+    const result = { action: 'update-branch', outcome: 'requested' } as const;
+    const shown = await renderPluginComponent(withResult(result, open), {
+      id: 'pull-requests',
+      plugin,
+    });
+    expect(shown.getByTestId('holds').textContent).toBe('true');
+    shown.unmount();
+    // Once the access that may write is gone, the line and its Dismiss are, and nothing holds.
+    const hidden = await renderPluginComponent(withResult(result, open, false), {
+      id: 'pull-requests',
+      plugin,
+    });
+    expect(hidden.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+    expect(hidden.getByTestId('holds').textContent).toBe('false');
+  });
 
   it('says an update whose new head did not show yet was requested, not made', async () => {
     const view = await renderPluginComponent(
@@ -563,20 +613,24 @@ describe('HeaderActions', () => {
   const isOff = (button: HTMLElement) =>
     button.hasAttribute('disabled') || button.getAttribute('aria-disabled') === 'true';
 
-  it('disables every control while an action runs, and says what runs', async () => {
+  it('disables every action while an action runs, and says what runs', async () => {
     writeAnswer = () => hold(() => respond({}));
     const view = await show();
     await openMenu(view);
     await click(row(view, 'Convert to draft'));
     expect(writes()).toHaveLength(1);
-    const buttons = Array.from(view.getByTestId('header-row').querySelectorAll('button'));
-    expect(buttons.length).toBeGreaterThan(1);
-    expect(buttons.every(isOff)).toBe(true);
+    expect(isOff(view.getByRole('button', { name: 'Merge' }))).toBe(true);
     expect(view.getByRole('status').textContent).toBe('Converting to draft...');
-    // Neither the menu opens nor the merge arms meanwhile.
+    // The menu still opens, with what starts no action: its actions and Refresh are off.
+    expect(isOff(moreActions(view))).toBe(false);
     await click(moreActions(view));
-    expect(moreActions(view).getAttribute('aria-expanded')).toBe('false');
-    expect(view.queryByText('Refresh')).toBeNull();
+    expect(moreActions(view).getAttribute('aria-expanded')).toBe('true');
+    expect(isOff(row(view, 'Convert to draft'))).toBe(true);
+    expect(isOff(row(view, 'Refresh'))).toBe(true);
+    expect(isOff(row(view, 'Open on GitHub'))).toBe(false);
+    expect(isOff(row(view, 'Copy checkout command'))).toBe(false);
+    await click(moreActions(view));
+    // Nor does the merge arm meanwhile.
     await click(view.getByRole('button', { name: 'Merge' }));
     expect(view.queryByRole('button', { name: 'Confirm merge?' })).toBeNull();
     expect(writes()).toHaveLength(1);
@@ -593,7 +647,8 @@ describe('HeaderActions', () => {
     await click(view.getByRole('button', { name: 'Confirm merge?' }));
     const pending = view.getByRole('button', { name: 'Merging...' });
     expect(isOff(pending)).toBe(true);
-    expect(isOff(moreActions(view))).toBe(true);
+    // More actions stays open to what starts no action.
+    expect(isOff(moreActions(view))).toBe(false);
   });
 
   describe('for a screen reader and the keyboard', () => {
