@@ -4,11 +4,21 @@
 // The app draws them as read-only rows, so nothing here is a control or takes the focus. A pull
 // request asks GitHub through the chips' own queries, so its chip's answer is already there. A pull
 // request on the worktree's branch says so, and the worktree then leaves its branch out. The open
-// thread's pull requests menu draws the same rows, each pull request as one of its items.
-import { Fragment, type ReactNode } from 'react';
-import { usePluginTranslation, type ThreadDetailProps } from '@mindroom/client-sdk/core';
+// thread's pull requests menu draws the same rows, each pull request as one of its items, and so
+// does the hover card of a pull request link in a message, for that pull request.
+import { Fragment, useMemo, type ReactNode } from 'react';
+import {
+  usePluginTranslation,
+  type MessageLinkHoverCardProps,
+  type ThreadDetailProps,
+} from '@mindroom/client-sdk/core';
 import { Folder, GitBranch, GitPullRequestArrow } from 'lucide-react';
-import { pullRequestUrl, type PullRequest, type PullRequestRef } from './github';
+import {
+  parsePullRequestUrl,
+  pullRequestUrl,
+  type PullRequest,
+  type PullRequestRef,
+} from './github';
 import { middleTruncate } from './middleTruncate';
 import {
   PullRequestDiffStat,
@@ -35,8 +45,14 @@ const PATH_MAX = 40;
 
 // A hover shows what GitHub answered a chip, however old: only a pull request it has no answer for
 // yet is asked for, so moving the pointer over cards spends none of the hourly limit. A refusal is an
-// answer too: without `retryOnMount` every hover would ask again for a pull request GitHub refused.
-export const ANSWERED_ONLY = { ...NO_FOCUS_REFETCH, refetchOnMount: false, retryOnMount: false };
+// answer too: without `retryOnMount` every hover would ask again for a pull request GitHub refused,
+// and the network coming back asks nothing either. (An answer the cache dropped is asked for again.)
+export const ANSWERED_ONLY = {
+  ...NO_FOCUS_REFETCH,
+  refetchOnMount: false,
+  retryOnMount: false,
+  refetchOnReconnect: false,
+};
 
 // How often the banner's button reads again a pull request that is still open or a draft.
 const UNSETTLED_INTERVAL = 5 * 60_000;
@@ -101,10 +117,24 @@ export function ThreadDetails({ room, threadId }: ThreadDetailProps) {
   );
 }
 
+/** The hover card of a pull request link: its rows in the banner's menu, read as the menu reads them. */
+export function PullRequestLinkHoverCard({ href, roomId }: MessageLinkHoverCardProps) {
+  const pullRequests = useMemo(() => {
+    const pullRequest = parsePullRequestUrl(new URL(href));
+    return pullRequest ? [pullRequest] : [];
+  }, [href]);
+  return (
+    <RoomGitHub roomId={roomId}>
+      <Details pullRequests={pullRequests} worktree={undefined} inBanner />
+    </RoomGitHub>
+  );
+}
+
 /**
  * The rows, inside `RoomGitHub`, so the heads are read with the room's access, as each chip reads
  * them. `item` wraps each pull request's and the worktree's rows (`pullRequest` undefined), as the
- * menu's items; `className` joins the root's. `inBanner`, the open thread's menu, reads stale
+ * menu's items; `className` joins the root's. `inBanner`, the open thread's menu (and a link's
+ * hover card), reads stale
  * answers again (`useBannerRefetch`); elsewhere they are a hover's, `ANSWERED_ONLY`.
  */
 export function Details({
