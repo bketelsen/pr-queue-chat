@@ -124,6 +124,40 @@ export type RefetchOptions = {
 // every chip seen so far would ask at once, and without a token that spends the hourly limit.
 export const NO_FOCUS_REFETCH = { refetchOnWindowFocus: false };
 
+// Share four slots across proxied summaries and checks. A summary sends one POST, checks up to two.
+const MAX_PROXY_READ_JOBS = 4;
+let proxyReadJobs = 0;
+const waitingProxyReads = new Set<() => void>();
+
+async function withProxyRead<T>(signal: AbortSignal, load: () => Promise<T>): Promise<T> {
+  signal.throwIfAborted();
+  if (proxyReadJobs < MAX_PROXY_READ_JOBS) proxyReadJobs += 1;
+  else {
+    await new Promise<void>((resolve, reject) => {
+      const start = () => {
+        waitingProxyReads.delete(start);
+        signal.removeEventListener('abort', abort);
+        resolve();
+      };
+      const abort = () => {
+        waitingProxyReads.delete(start);
+        reject(signal.reason);
+      };
+      waitingProxyReads.add(start);
+      signal.addEventListener('abort', abort, { once: true });
+    });
+  }
+  try {
+    // A queued read can be aborted after receiving a slot but before resuming.
+    signal.throwIfAborted();
+    return await load();
+  } finally {
+    const next = waitingProxyReads.values().next().value;
+    if (next) next();
+    else proxyReadJobs -= 1;
+  }
+}
+
 // The query of one pull request, the same for `usePullRequest` and `usePullRequests`.
 const pullRequestQuery = (
   ref: PullRequestRef | undefined,
@@ -133,14 +167,17 @@ const pullRequestQuery = (
 ) => ({
   queryKey: keyOf(ref, access.key),
   queryFn: ({ signal }: { signal: AbortSignal }) => {
-    const before = client.getQueryData<PullRequest>(keyOf(ref, access.key));
-    return fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal).then(
-      (pr) => (before && refusedData.delete(before), pr),
-      (error: unknown) => {
-        if (before && refused(error)) refusedData.add(before);
-        throw error;
-      }
-    );
+    const read = () => {
+      const before = client.getQueryData<PullRequest>(keyOf(ref, access.key));
+      return fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal).then(
+        (pr) => (before && refusedData.delete(before), pr),
+        (error: unknown) => {
+          if (before && refused(error)) refusedData.add(before);
+          throw error;
+        }
+      );
+    };
+    return access.via === 'server' ? withProxyRead(signal, read) : read();
   },
   enabled: ref !== undefined && !access.pending,
   staleTime: STALE_TIME,
@@ -273,12 +310,16 @@ function useRefQuery<T>(
   enabled: boolean,
   part: readonly (string | undefined)[],
   load: (ref: PullRequestRef, token: GitHubAuth | undefined, signal: AbortSignal) => Promise<T>,
-  options: RefetchOptions = {}
+  options: RefetchOptions = {},
+  limitProxyReads = false
 ) {
   const access = useGitHubAccess();
   return useQuery({
     queryKey: [...keyOf(ref, access.key), ...part] as const,
-    queryFn: ({ signal }) => load(ref as PullRequestRef, access.authFor(access.key), signal),
+    queryFn: ({ signal }) => {
+      const read = () => load(ref as PullRequestRef, access.authFor(access.key), signal);
+      return limitProxyReads && access.via === 'server' ? withProxyRead(signal, read) : read();
+    },
     enabled: enabled && ref !== undefined && !access.pending,
     staleTime: STALE_TIME,
     retry,
@@ -297,7 +338,8 @@ export const useChecks = (
     enabled && headSha !== '',
     ['checks', headSha],
     (r, token, signal) => fetchChecks(r, headSha, token, signal),
-    options
+    options,
+    true // Limit proxied reads.
   );
 
 export const useBehindBy = (

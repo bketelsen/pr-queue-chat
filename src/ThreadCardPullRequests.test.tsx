@@ -6,6 +6,7 @@ import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import plugin from './index';
 import { linkedRoom, type TestLink, type TestWorktree } from './testing/linkedRoom';
+import { githubServer } from './testing/mindroomServer';
 import { ThreadCardPullRequests } from './ThreadCardPullRequests';
 
 const ROOM_ID = '!room:example.org';
@@ -88,6 +89,7 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock);
 });
 afterEach(() => {
+  roomServer.current = undefined;
   vi.unstubAllGlobals();
 });
 
@@ -154,6 +156,69 @@ describe('ThreadCardPullRequests', () => {
     expect(page.panelReads).toBe(0);
     await show(roomWith([{ number: 1 }]));
     expect(page.panelReads).toBeGreaterThan(0);
+  });
+
+  it('limits simultaneous proxied reads when many phone cards show at once', async () => {
+    // Without an IntersectionObserver, all these chips are eligible to read at once.
+    vi.stubGlobal('IntersectionObserver', undefined);
+    const links = Array.from({ length: 8 }, (_, i) => ({
+      thread: `$sample${i}`,
+      repo: 'sample-repo',
+      number: i + 1,
+    }));
+    const room = roomWith(links);
+    let releaseSummaries = () => {};
+    let releaseChecks = () => {};
+    const summariesHeld = new Promise<void>((resolve) => (releaseSummaries = resolve));
+    const checksHeld = new Promise<void>((resolve) => (releaseChecks = resolve));
+    const mindroom = githubServer(async (url) => {
+      if (url.includes('/pulls/')) {
+        await summariesHeld;
+        return Response.json({ title: 'Sample change', state: 'open', head: { sha: 'abc123' } });
+      }
+      await checksHeld;
+      if (url.includes('/check-runs?')) {
+        return Response.json({
+          check_runs: [{ name: 'Build', status: 'completed', conclusion: 'success' }],
+        });
+      }
+      return Response.json({ statuses: [] });
+    });
+    roomServer.current = mindroom.server;
+    const client = new QueryClient();
+    const view = await renderPluginComponent(
+      <QueryClientProvider client={client}>
+        {links.map(({ thread }) => (
+          <ThreadCardPullRequests key={thread} room={room} threadId={thread} />
+        ))}
+      </QueryClientProvider>,
+      { id: 'pull-requests', plugin, screenSize: 'Mobile' }
+    );
+    try {
+      await vi.waitFor(() => expect(mindroom.githubRequests().length).toBeGreaterThanOrEqual(4));
+      // Until some replies come back, the other PR reads must not reach the wire.
+      expect(mindroom.githubRequests()).toHaveLength(4);
+      releaseSummaries();
+      const checks = () =>
+        mindroom.githubRequests().filter(({ path }) => path.includes('/commits/'));
+      await vi.waitFor(() => expect(checks().length).toBeGreaterThanOrEqual(8));
+      expect(checks()).toHaveLength(8);
+    } finally {
+      releaseSummaries();
+      releaseChecks();
+    }
+    await vi.waitFor(() => {
+      expect(view.container.querySelectorAll('.mrpr-chip-checks')).toHaveLength(links.length);
+      expect(client.isFetching()).toBe(0);
+    });
+    const requests = mindroom.githubRequests();
+    expect(requests).toHaveLength(3 * links.length);
+    expect(requests.every(({ method }) => method === 'GET')).toBe(true);
+    expect(
+      mindroom.server.request.mock.calls.filter(
+        ([path, init]) => path === '/api/github/request' && init?.method === 'POST'
+      )
+    ).toHaveLength(requests.length);
   });
 
   it('shows two chips and the count of the rest', async () => {
