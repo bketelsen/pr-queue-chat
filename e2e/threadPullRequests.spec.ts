@@ -936,7 +936,7 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
   const box = (await stat.boundingBox())!;
   const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
   await page.mouse.move(x, y);
-  const tooltip = page.getByRole('dialog', { name: /^Lines changed/ });
+  const tooltip = page.getByRole('tooltip').filter({ has: page.locator('.mrpr-breakdown') });
   await expect(tooltip).toBeVisible();
   for (const dx of [-3, -1, 1, 3, 0]) {
     await page.mouse.move(x + dx, y);
@@ -1017,7 +1017,7 @@ for (const delay of [0, 800]) {
         timeout: 30_000,
       });
       const stat = panel(page).getByRole('button', { name: /^Lines changed/ });
-      const selector = '[aria-label^="Lines changed"] .mrpr-popover-fit';
+      const selector = '.mrpr-popover-fit';
       const surface = page.locator(selector);
       expect(requests).toBe(0);
       await expect(surface).toHaveCount(0);
@@ -1065,7 +1065,9 @@ for (const delay of [0, 800]) {
         expect(missingAfterOpen, `frames missing after tap ${tap}`).toBe(0);
         await expect(surface).toContainText('Total');
       }
-      await shot(page, `phone-lines-${delay}`, { keepPointer: true });
+      await shot(page, `phone-lines-${browser.browserType().name()}-${delay}`, {
+        keepPointer: true,
+      });
       expect(requests).toBe(1);
       expect(unanswered).toEqual([]);
     } finally {

@@ -593,12 +593,12 @@ describe('PullRequestPanel', () => {
       await view.findByText('Add pull request cards');
       expect(filesRequests()).toHaveLength(0);
       const stat = view.getByRole('button', { name: /^Lines changed/ });
-      expect(stat.getAttribute('aria-haspopup')).toBe('dialog');
-      expect(stat.getAttribute('aria-expanded')).toBe('false');
+      expect(stat.hasAttribute('aria-describedby')).toBe(false);
       await act(async () => stat.focus());
       await view.findByText('Total');
-      expect(stat.getAttribute('aria-expanded')).toBe('true');
-      expect(view.getByRole('dialog', { name: 'Lines changed: +20 -13' })).toBeTruthy();
+      const tooltip = view.getByRole('tooltip');
+      expect(stat.getAttribute('aria-describedby')).toBe(tooltip.id);
+      expect(document.activeElement).toBe(stat);
       expect(view.queryByRole('menu')).toBeNull();
       expect(document.querySelector('.mrpr-breakdown')?.textContent).toBe(
         'Code+5-1Tests+3-0Generated+10-10Docs+2-2Total+20-13'

@@ -1,7 +1,7 @@
 // Ported from T3 Code (https://github.com/pingdotgg/t3code, apps/web/src/components/pullRequest/PullRequestChangeBreakdownStat.tsx at 8ab427c6), MIT, Copyright (c) 2026 T3 Tools Inc. See NOTICE.
 // The header's `+/-` stat, with a popover that splits the lines into code, tests, generated files
 // and docs. The files load on first focus or hover unless the Code tab already has them.
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import type { RectCords } from 'folds';
 import { usePluginTranslation } from '@mindroom/client-sdk/core';
 import { Menu, PopOut } from '@mindroom/client-sdk/ui';
@@ -41,6 +41,7 @@ export function ChangeBreakdownStat({
   deletions: number;
 }) {
   const t = usePluginTranslation('pull-requests');
+  const tooltipId = useId();
   const [requested, setRequested] = useState(false);
   const [anchor, setAnchor] = useState<RectCords>();
   // Files the Code tab loaded already are in the cache, so a disabled query still has them.
@@ -58,8 +59,7 @@ export function ChangeBreakdownStat({
         type="button"
         className="mrpr-stat-button"
         aria-label={label}
-        aria-haspopup="dialog"
-        aria-expanded={anchor !== undefined && !query.isError}
+        aria-describedby={anchor && !query.isError ? tooltipId : undefined}
         onFocus={(event) => open(event.currentTarget)}
         onBlur={() => setAnchor(undefined)}
         onPointerEnter={(event) => open(event.currentTarget)}
@@ -82,7 +82,9 @@ export function ChangeBreakdownStat({
           align="End"
           offset={4}
           content={
-            <Menu role="dialog" aria-label={label}>
+            // The host moves focus into dialogs. This read-only tooltip must leave it on the stat,
+            // whose blur would otherwise remove the popover and send focus back to the stat.
+            <Menu id={tooltipId} role="tooltip">
               <div className="mrpr-root mrpr-popover mrpr-popover-fit" style={pluginRootStyle()}>
                 {rows ? (
                   <div className="mrpr-breakdown">
