@@ -4,8 +4,11 @@ import {
   useQueries,
   useQuery,
   useQueryClient,
+  type InvalidateQueryFilters,
   type Query,
+  type QueryCache,
   type QueryClient,
+  type QueryFunctionContext,
 } from '@tanstack/react-query';
 import {
   fetchBehindBy,
@@ -59,6 +62,29 @@ export const repositoryKey = (ref: PullRequestRef | undefined) =>
 const keyOf = (ref: PullRequestRef | undefined, access: AccessKey) =>
   [...pullRequestKey(ref), access] as const;
 
+// A write can finish waiting for its summary while its other refetches are still running.
+const writeRefreshes = new WeakMap<Query, number>();
+
+function invalidateAfterWrite(client: QueryClient, filters: InvalidateQueryFilters) {
+  const active = client.getQueryCache().findAll({ ...filters, type: 'active' });
+  for (const query of active) writeRefreshes.set(query, (writeRefreshes.get(query) ?? 0) + 1);
+  const refreshed = client.invalidateQueries(filters);
+  for (const query of active) {
+    // A cached read can be replaced on invalidation; a cold read is joined instead.
+    waitingProxyReads.get(query)?.(false);
+    const release = () => {
+      const count = writeRefreshes.get(query) ?? 0;
+      if (count <= 1) writeRefreshes.delete(query);
+      else writeRefreshes.set(query, count - 1);
+    };
+    // Invalidation itself does not await offline reads; keep priority until each fetch settles.
+    const fetching = query.promise;
+    if (fetching) void fetching.then(release, release);
+    else release();
+  }
+  return refreshed;
+}
+
 /**
  * After a write: everything read of the pull request is stale and asked again, and the promise
  * settles once the pull request itself is read again. Its other parts (the files, the checks,
@@ -80,8 +106,8 @@ export async function refreshPullRequest(
   const own = (query: Query) => query.queryKey.length === used.length;
   const read = (query: Query) => own(query) && query.queryKey[queryKey.length] === access;
   // Each query once: asked again by both, the first request would be dropped for the second.
-  void queryClient.invalidateQueries({ queryKey, predicate: (query) => !read(query) });
-  await queryClient.invalidateQueries({ queryKey, predicate: read });
+  void invalidateAfterWrite(queryClient, { queryKey, predicate: (query) => !read(query) });
+  await invalidateAfterWrite(queryClient, { queryKey, predicate: read });
   // Only what is on screen was asked again; a failure of an earlier read, as the one without a
   // token of a private pull request, is not this read's.
   const shown = queryClient.getQueryCache().findAll({ queryKey, predicate: read, type: 'active' });
@@ -105,11 +131,15 @@ export const unlessRefused = (query: QueryState) => !isRefused(query.state);
 export const answerOf = <T>(query: { data: T | undefined; error: unknown }) =>
   isRefused(query) ? undefined : query.data;
 
+// Mark overview observers without changing the query key shared with foreground surfaces.
+export const BACKGROUND_READ = { meta: { mindroomPullRequestsBackground: true } } as const;
+
 /** What a caller can change of a query's refetching: the chips leave out the refetch on window focus,
  * a thread's details also the one on mount, for an answer and for a refusal alike, and the banner's
  * button with access adds an interval (`useBannerRefetch`); `enabled: false` reads only what is
  * already there. */
 export type RefetchOptions = {
+  meta?: typeof BACKGROUND_READ.meta;
   enabled?: false;
   refetchOnWindowFocus?: boolean | ((query: QueryState) => boolean);
   refetchOnMount?: boolean | ((query: QueryState) => boolean);
@@ -124,23 +154,99 @@ export type RefetchOptions = {
 // every chip seen so far would ask at once, and without a token that spends the hourly limit.
 export const NO_FOCUS_REFETCH = { refetchOnWindowFocus: false };
 
+// Share four slots across background proxied summaries and checks (one or up to two POSTs).
+const MAX_PROXY_READ_JOBS = 4;
+let proxyReadJobs = 0;
+const waitingProxyReads = new Map<Query, (occupiesSlot: boolean) => void>();
+const watchedProxyCaches = new WeakSet<QueryCache>();
+
+function observerPriority(query: Query) {
+  let background = false;
+  for (const observer of query.observers) {
+    const { enabled, meta } = observer.options;
+    if ((typeof enabled === 'function' ? enabled(query) : enabled) === false) continue;
+    if (meta?.mindroomPullRequestsBackground !== true) return 'foreground';
+    background = true;
+  }
+  return background ? 'background' : undefined;
+}
+
+function watchProxyReads(cache: QueryCache) {
+  if (watchedProxyCaches.has(cache)) return;
+  watchedProxyCaches.add(cache);
+  cache.subscribe(({ type, query }) => {
+    if (type !== 'observerAdded' && type !== 'observerOptionsUpdated') return;
+    const start = waitingProxyReads.get(query);
+    if (start && observerPriority(query) === 'foreground') start(false);
+  });
+}
+
+async function withProxyRead<T>(
+  { client, queryKey, signal, meta }: QueryFunctionContext,
+  load: () => Promise<T>
+): Promise<T> {
+  signal.throwIfAborted();
+  const cache = client.getQueryCache();
+  const query = cache.get(client.defaultQueryOptions({ queryKey }).queryHash);
+  if (!query || writeRefreshes.has(query)) return load();
+  // Check on every fetch attempt, regardless of which observer's options initiated it.
+  const priority = observerPriority(query);
+  const background =
+    priority === 'background' ||
+    (priority === undefined && meta?.mindroomPullRequestsBackground === true);
+  if (!background) return load();
+
+  let occupiesSlot = true;
+  if (proxyReadJobs < MAX_PROXY_READ_JOBS) proxyReadJobs += 1;
+  else {
+    watchProxyReads(cache);
+    occupiesSlot = await new Promise<boolean>((resolve, reject) => {
+      const start = (slot: boolean) => {
+        waitingProxyReads.delete(query);
+        signal.removeEventListener('abort', abort);
+        resolve(slot);
+      };
+      const abort = () => {
+        waitingProxyReads.delete(query);
+        reject(signal.reason);
+      };
+      waitingProxyReads.set(query, start);
+      signal.addEventListener('abort', abort, { once: true });
+    });
+  }
+  try {
+    // A queued read can be aborted after release but before resuming.
+    signal.throwIfAborted();
+    return await load();
+  } finally {
+    if (occupiesSlot) {
+      const next = waitingProxyReads.values().next().value;
+      if (next) next(true);
+      else proxyReadJobs -= 1;
+    }
+  }
+}
+
 // The query of one pull request, the same for `usePullRequest` and `usePullRequests`.
 const pullRequestQuery = (
   ref: PullRequestRef | undefined,
   access: GitHubAccess,
-  options: RefetchOptions,
-  client: QueryClient
+  options: RefetchOptions
 ) => ({
   queryKey: keyOf(ref, access.key),
-  queryFn: ({ signal }: { signal: AbortSignal }) => {
-    const before = client.getQueryData<PullRequest>(keyOf(ref, access.key));
-    return fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal).then(
-      (pr) => (before && refusedData.delete(before), pr),
-      (error: unknown) => {
-        if (before && refused(error)) refusedData.add(before);
-        throw error;
-      }
-    );
+  queryFn: (context: QueryFunctionContext) => {
+    const { client, queryKey, signal } = context;
+    const read = () => {
+      const before = client.getQueryData<PullRequest>(queryKey);
+      return fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal).then(
+        (pr) => (before && refusedData.delete(before), pr),
+        (error: unknown) => {
+          if (before && refused(error)) refusedData.add(before);
+          throw error;
+        }
+      );
+    };
+    return access.via === 'server' ? withProxyRead(context, read) : read();
   },
   enabled: ref !== undefined && !access.pending,
   staleTime: STALE_TIME,
@@ -149,7 +255,7 @@ const pullRequestQuery = (
 });
 
 export function usePullRequest(ref: PullRequestRef | undefined, options: RefetchOptions = {}) {
-  return useQuery(pullRequestQuery(ref, useGitHubAccess(), options, useQueryClient()));
+  return useQuery(pullRequestQuery(ref, useGitHubAccess(), options));
 }
 
 // GitHub computes whether a pull request merges after its base moved, in about a second; until
@@ -201,8 +307,7 @@ export function useMergeableRecheck(
 /** The pull requests `refs` as `usePullRequest` reads each, through the same queries. */
 export function usePullRequests(refs: readonly PullRequestRef[], options: RefetchOptions = {}) {
   const access = useGitHubAccess();
-  const client = useQueryClient();
-  return useQueries({ queries: refs.map((ref) => pullRequestQuery(ref, access, options, client)) });
+  return useQueries({ queries: refs.map((ref) => pullRequestQuery(ref, access, options)) });
 }
 
 export function usePullRequestFiles(ref: PullRequestRef | undefined, enabled: boolean) {
@@ -273,12 +378,17 @@ function useRefQuery<T>(
   enabled: boolean,
   part: readonly (string | undefined)[],
   load: (ref: PullRequestRef, token: GitHubAuth | undefined, signal: AbortSignal) => Promise<T>,
-  options: RefetchOptions = {}
+  options: RefetchOptions = {},
+  limitProxyReads = false
 ) {
   const access = useGitHubAccess();
   return useQuery({
     queryKey: [...keyOf(ref, access.key), ...part] as const,
-    queryFn: ({ signal }) => load(ref as PullRequestRef, access.authFor(access.key), signal),
+    queryFn: (context) => {
+      const { signal } = context;
+      const read = () => load(ref as PullRequestRef, access.authFor(access.key), signal);
+      return limitProxyReads && access.via === 'server' ? withProxyRead(context, read) : read();
+    },
     enabled: enabled && ref !== undefined && !access.pending,
     staleTime: STALE_TIME,
     retry,
@@ -297,7 +407,8 @@ export const useChecks = (
     enabled && headSha !== '',
     ['checks', headSha],
     (r, token, signal) => fetchChecks(r, headSha, token, signal),
-    options
+    options,
+    true // Limit background proxied reads.
   );
 
 export const useBehindBy = (
