@@ -1000,40 +1000,40 @@ const openLinesPanel = async (page: Page, input: 'tap' | 'click') => {
 
 /** Samples the actual popup from contact, even if Playwright waits before making that contact. */
 const sampleLinesPress = (stat: Locator) =>
-  stat.evaluateHandle(
-    (button, selector) => ({
-      done: new Promise<{ visible: number; missingAfterOpen: number }>((resolve) => {
-        button.addEventListener(
-          'pointerdown',
-          () => {
-            const until = performance.now() + 1_500;
-            const frames = { visible: 0, missingAfterOpen: 0 };
-            const sample = () => {
-              const rect = document.querySelector(selector)?.getBoundingClientRect();
-              if (
-                rect &&
-                rect.width > 0 &&
-                rect.height > 0 &&
-                rect.left >= 0 &&
-                rect.top >= 0 &&
-                rect.right <= innerWidth &&
-                rect.bottom <= innerHeight
-              ) {
-                frames.visible += 1;
-              } else if (frames.visible) {
-                frames.missingAfterOpen += 1;
-              }
-              if (performance.now() < until) requestAnimationFrame(sample);
-              else resolve(frames);
-            };
-            requestAnimationFrame(sample);
-          },
-          { once: true }
-        );
-      }),
-    }),
-    linesSurface
-  );
+  stat.evaluateHandle((button, selector) => {
+    const done = new Promise<{ visible: number; missingAfterOpen: number } | null>((resolve) => {
+      const onContact = () => {
+        clearTimeout(contactTimeout);
+        const until = performance.now() + 1_500;
+        const frames = { visible: 0, missingAfterOpen: 0 };
+        const sample = () => {
+          const rect = document.querySelector(selector)?.getBoundingClientRect();
+          if (
+            rect &&
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.left >= 0 &&
+            rect.top >= 0 &&
+            rect.right <= innerWidth &&
+            rect.bottom <= innerHeight
+          ) {
+            frames.visible += 1;
+          } else if (frames.visible) {
+            frames.missingAfterOpen += 1;
+          }
+          if (performance.now() < until) requestAnimationFrame(sample);
+          else resolve(frames);
+        };
+        requestAnimationFrame(sample);
+      };
+      const contactTimeout = window.setTimeout(() => {
+        button.removeEventListener('pointerdown', onContact);
+        resolve(null);
+      }, 5_000);
+      button.addEventListener('pointerdown', onContact, { once: true });
+    });
+    return { done };
+  }, linesSurface);
 
 const holdLinesStat = async (page: Page, stat: Locator) => {
   await stat.tap({ trial: true });
@@ -1117,8 +1117,13 @@ test.describe('phone lines tooltip', () => {
         const sampler = await sampleLinesPress(stat);
         const openBeforeLift = press === 'hold' ? await holdLinesStat(page, stat) : 0;
         if (press === 'tap') await stat.tap();
-        const { visible, missingAfterOpen } = await sampler.evaluate(({ done }) => done);
+        const frames = await sampler.evaluate(async ({ done }) => {
+          const frames = await done;
+          if (!frames) throw new Error('no pointerdown on stat');
+          return frames;
+        });
         await sampler.dispose();
+        const { visible, missingAfterOpen } = frames;
         expect(openBeforeLift, 'a held finger must not open the tooltip before the tap').toBe(0);
         expect(visible).toBeGreaterThan(1);
         expect(missingAfterOpen, 'frames missing after opening').toBe(0);
