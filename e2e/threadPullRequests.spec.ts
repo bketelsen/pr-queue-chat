@@ -1044,7 +1044,9 @@ const holdLinesStat = async (page: Page, stat: Locator) => {
     });
     // A short hold leaves enough time to see what pointerenter did before the finger lifts.
     await page.waitForTimeout(100);
+    const openBeforeLift = await page.locator(linesSurface).count();
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    return openBeforeLift;
   } finally {
     await cdp.detach();
   }
@@ -1111,10 +1113,11 @@ test.describe('phone lines tooltip', () => {
         expect(requests).toBe(0);
         await expect(surface).toHaveCount(0);
         const sampler = await sampleLinesPress(stat);
-        if (press === 'hold') await holdLinesStat(page, stat);
-        else await stat.tap();
+        const openBeforeLift = press === 'hold' ? await holdLinesStat(page, stat) : 0;
+        if (press === 'tap') await stat.tap();
         const { visible, missingAfterOpen } = await sampler.evaluate(({ done }) => done);
         await sampler.dispose();
+        expect(openBeforeLift, 'a held finger must not open the tooltip before the tap').toBe(0);
         expect(visible).toBeGreaterThan(1);
         expect(missingAfterOpen, 'frames missing after opening').toBe(0);
         await expect(surface).toContainText('Total');
