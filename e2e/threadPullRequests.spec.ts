@@ -22,10 +22,10 @@ import { touch } from '@mindroom/e2e/touch';
 // A thread's pull requests in a production build with this plugin, against the disposable
 // homeserver, with GitHub's API answered by the page (no request leaves the test). The links are
 // the room state events MindRoom's backend plugin writes; here the room's creator writes them. A
-// thread's card in the Compact view shows a chip per pull request, two at most (one on a phone) and
-// the count of the rest; a click on a chip opens the thread and the pull request in the side
-// panel; the open thread's banner has one button for its pull requests, in the color of their state
-// together (open, merged or closed), whose menu lists them and
+// thread's card in the Compact view shows up to two chips (one on a phone) in the pull requests
+// menu's order and the count of the rest; a click on a chip opens the thread and the pull request
+// in the side panel; the open thread's banner has one button for its pull requests, in the color
+// of their state together (open, merged or closed), whose menu lists them and
 // opens each in the panel, the panel's marked current; a mouse that rests on a chip on a card
 // opens its hover card beside it;
 // a link written or cleared while the room is open shows on its card at once, also after a gap in
@@ -628,7 +628,8 @@ const THREADS = {
       ['agent', 'Eleven pull requests so far, across the webapp and the API.'],
       ['lead', 'Keep them in one thread so I can review them in order.'],
     ],
-    pulls: ALL_PULLS,
+    // The oldest link is merged, but the card shows the open ones first.
+    pulls: [PULLS.rateLimit, ...ALL_PULLS.filter((pull) => pull !== PULLS.rateLimit)],
   },
   search: {
     topic: 'Search is slow in large workspaces',
@@ -652,7 +653,7 @@ const THREADS = {
       ['agent', 'Merged the rate limit per token and the changelog; closed the limit per IP.'],
       ['lead', 'Thanks. I will tag the release after lunch.'],
     ],
-    // A merged and a closed pull request show on the card, in their colors.
+    // The closed pull request and the more recently updated merged one show on the card.
     pulls: [PULLS.rateLimit, PULLS.ipRateLimit, PULLS.changelog],
   },
   checkout: {
@@ -782,7 +783,12 @@ const chipName = (pull: Pull) =>
 
 const card = (page: Page, root: string) =>
   page.locator(`[data-compact-room-view] [data-thread-root-id="${root}"]`);
-const cardChips = (page: Page, root: string) => card(page, root).locator('.mrpr-chip');
+const cardChips = (page: Page, root: string, pull?: Pull) =>
+  pull
+    ? card(page, root).getByRole('img', {
+        name: new RegExp(`^Pull request acme/${pull.repo} #${pull.number}(?::|$)`),
+      })
+    : card(page, root).locator('.mrpr-chip');
 const cardMore = (page: Page, root: string) => card(page, root).locator('.mrpr-chip-more');
 const panel = (page: Page) => page.getByRole('region', { name: 'Pull request', exact: true });
 const banner = (page: Page) => page.locator('[data-thread-context-banner]');
@@ -860,8 +866,9 @@ test("each thread's card shows the chips of its pull requests", async ({ page })
   await expect(cardMore(page, roots.sessions)).toHaveCount(0);
   await expectChips(cardChips(page, roots.darkMode), THREADS.darkMode.pulls);
   await expectChips(cardChips(page, roots.checkout), THREADS.checkout.pulls);
-  // Three pull requests: the first two, then the count of the rest.
-  await expectChips(cardChips(page, roots.release), THREADS.release.pulls.slice(0, 2));
+  await expectChips(cardChips(page, roots.program), [PULLS.sessionStore, PULLS.tokenEndpoint]);
+  // Three pull requests: the closed one, the more recently updated merged one, and the count.
+  await expectChips(cardChips(page, roots.release), [PULLS.ipRateLimit, PULLS.changelog]);
   await expect(cardMore(page, roots.release)).toHaveText('+1');
   await expect(cardMore(page, roots.release)).toHaveAttribute('aria-label', '1 more pull request');
   // A thread without a link has no chips at all.
@@ -886,7 +893,7 @@ test("a chip on a card opens the thread and its pull request; the banner's menu 
   const [sessionStore, tokenEndpoint] = THREADS.sessions.pulls;
   await expectChips(cardChips(page, roots.sessions), [sessionStore, tokenEndpoint]);
 
-  await cardChips(page, roots.sessions).first().click();
+  await cardChips(page, roots.sessions, PULLS.sessionStore).click();
   // The banner's title gives the pull requests button room, so it may show only its start.
   await expect(banner(page)).toContainText('Move session storage', { timeout: 30_000 });
   await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(sessionStore.title, {
@@ -926,7 +933,7 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
   test.setTimeout(4 * 60_000);
   const unanswered = await stubGitHub(page);
   await openRoom(page);
-  await cardChips(page, roots.sessions).first().click();
+  await cardChips(page, roots.sessions, PULLS.sessionStore).click();
   await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(PULLS.sessionStore.title, {
     timeout: 30_000,
   });
@@ -993,7 +1000,7 @@ const linesSurface = '.mrpr-popover-fit';
 
 const openLinesPanel = async (page: Page, input: 'tap' | 'click') => {
   await openRoom(page);
-  await cardChips(page, roots.sessions).first()[input]();
+  await cardChips(page, roots.sessions, PULLS.sessionStore)[input]();
   const title = panel(page).locator('.mrpr-panel-title');
   await expect(title).toHaveText(PULLS.sessionStore.title, { timeout: 30_000 });
   return title;
@@ -1188,7 +1195,7 @@ test('the Code tab highlights a hunk inside a docstring and can expand its conte
     await route.fulfill({ headers: CORS, body: greenhouseAfter });
   });
   await openRoom(page);
-  await cardChips(page, roots.sessions).first().click();
+  await cardChips(page, roots.sessions, PULLS.sessionStore).click();
   const code = panel(page);
   await code.getByRole('tab', { name: 'Code' }).click();
   const lines = code.locator('[data-line]');
@@ -1254,7 +1261,7 @@ test("Page Zoom scales the panel's text, its diffs and its file tree", async ({ 
     }, pageZoom);
     await page.goto(`/home/${encodeURIComponent(roomId)}`);
     await expect(page.locator('html')).toHaveCSS('font-size', `${(16 * pageZoom) / 100}px`);
-    const cardChip = cardChips(page, roots.sessions).first();
+    const cardChip = cardChips(page, roots.sessions, PULLS.sessionStore);
     await expect(cardChip).toBeVisible({ timeout: 120_000 });
     const chip = await fontSize(cardChip);
     await cardChip.click();
@@ -1333,7 +1340,7 @@ test('a pinch zoom keeps the file tree as it was: folded folders, selection, foc
     (route) => route.fulfill({ headers: CORS, json: TREE_FILES })
   );
   await openRoom(page);
-  await cardChips(page, roots.sessions).first().click();
+  await cardChips(page, roots.sessions, PULLS.sessionStore).click();
   await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(pull!.title, {
     timeout: 30_000,
   });
@@ -1826,16 +1833,16 @@ test("a chip's hover card shows its pull request on a card", async ({ page }) =>
   const warnings = listenerWarnings(page);
   await openRoom(page);
   const [sessionStore, tokenEndpoint] = THREADS.sessions.pulls;
-  const chips = cardChips(page, roots.sessions);
-  await expectChips(chips, [sessionStore, tokenEndpoint]);
+  await expectChips(cardChips(page, roots.sessions), [sessionStore, tokenEndpoint]);
 
   // On a card: the pull request, its checks and its reviewer's verdict, which it asks for now.
-  await chips.nth(1).hover();
+  const tokenChip = cardChips(page, roots.sessions, tokenEndpoint);
+  await tokenChip.hover();
   await expect(hoverCard(page)).toContainText(tokenEndpoint.title);
   await expect(hoverCard(page)).toContainText('All checks have passed');
   await expect(hoverCard(page)).toContainText(PULLS.tokenEndpoint.approvedBy);
   await expect(hoverCard(page)).toContainText('Click to open in the side panel');
-  await expectBeside(page, chips.nth(1));
+  await expectBeside(page, tokenChip);
   // The card's details card, which waits 500 ms, stays closed while the chip shows its own.
   await page.waitForTimeout(1_000);
   await expect(page.locator('[data-thread-card-details]')).toHaveCount(0);
@@ -1844,9 +1851,10 @@ test("a chip's hover card shows its pull request on a card", async ({ page }) =>
   await expect(hoverCard(page)).toHaveCount(0);
 
   // A closed pull request lower in the room: its close, and no checks.
-  const [, ipRateLimit] = THREADS.release.pulls;
-  const release = cardChips(page, roots.release).nth(1);
-  await release.scrollIntoViewIfNeeded();
+  const { ipRateLimit } = PULLS;
+  const release = cardChips(page, roots.release, ipRateLimit);
+  await card(page, roots.release).scrollIntoViewIfNeeded();
+  await expect(release).toHaveAttribute('aria-label', chipName(ipRateLimit), { timeout: 30_000 });
   await release.hover();
   await expect(hoverCard(page)).toContainText(ipRateLimit.title);
   await expect(hoverCard(page)).toContainText('Closed');
@@ -1864,7 +1872,7 @@ test('a hover card as tall as the room by its chip keeps its rows apart', async 
   const unanswered = await stubGitHub(page);
   await page.setViewportSize({ width: 1280, height: 720 });
   await openRoom(page);
-  const chip = cardChips(page, roots.checkout).first();
+  const chip = cardChips(page, roots.checkout, PULLS.checkoutClock);
   await expectChips(cardChips(page, roots.checkout), THREADS.checkout.pulls);
   // Near the window's middle, the card has about half the window's height to fill.
   const at = await chip.boundingBox();
@@ -1958,7 +1966,8 @@ test('on a phone a card shows one chip and the count of the rest', async ({ brow
     await expectChips(cardChips(page, roots.darkMode), [PULLS.darkMode]);
     await expect(cardMore(page, roots.darkMode)).toHaveCount(0);
     await expectChips(cardChips(page, roots.checkout), [PULLS.checkoutClock]);
-    await expectChips(cardChips(page, roots.release), [PULLS.rateLimit]);
+    await expectChips(cardChips(page, roots.program), [PULLS.sessionStore]);
+    await expectChips(cardChips(page, roots.release), [PULLS.ipRateLimit]);
     await expect(cardMore(page, roots.release)).toHaveText('+2');
     await expect(cardMore(page, roots.release)).toHaveAttribute(
       'aria-label',
@@ -2294,7 +2303,7 @@ test("a viewer who can write merges the panel's pull request with two clicks", a
   await openRoom(page);
   const { tokenEndpoint } = PULLS;
   await expectChips(cardChips(page, roots.sessions), THREADS.sessions.pulls);
-  await cardChips(page, roots.sessions).nth(1).click();
+  await cardChips(page, roots.sessions, tokenEndpoint).click();
   await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(tokenEndpoint.title, {
     timeout: 30_000,
   });
@@ -2396,7 +2405,7 @@ test("a viewer who can write merges the panel's pull request with two clicks", a
 const openTokenEndpoint = async (page: Page) => {
   const { tokenEndpoint } = PULLS;
   await expectChips(cardChips(page, roots.sessions), THREADS.sessions.pulls);
-  await cardChips(page, roots.sessions).nth(1).click();
+  await cardChips(page, roots.sessions, tokenEndpoint).click();
   await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(tokenEndpoint.title, {
     timeout: 30_000,
   });
@@ -2602,7 +2611,7 @@ test("on a phone the panel's header has the controls", async ({ browser, baseURL
     const warnings = listenerWarnings(page);
     await openRoom(page);
     await expectChips(cardChips(page, roots.sessions), [PULLS.sessionStore]);
-    await cardChips(page, roots.sessions).first().click();
+    await cardChips(page, roots.sessions, PULLS.sessionStore).click();
     await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(PULLS.sessionStore.title, {
       timeout: 30_000,
     });
@@ -2657,7 +2666,7 @@ test('on a phone the header scrolls away under a bar that brings it back', async
   try {
     await stubGitHub(page);
     await openRoom(page);
-    await cardChips(page, roots.sessions).first().click();
+    await cardChips(page, roots.sessions, PULLS.sessionStore).click();
     const title = panel(page).locator('.mrpr-panel-title');
     await expect(title).toHaveText(PULLS.sessionStore.title, { timeout: 30_000 });
     // The room draws no title row: the panel's own top row, with its Close, is its top.
@@ -2736,7 +2745,7 @@ test("without a token, the GitHub account connected in MindRoom reads and merges
   // The chips have their checks' marks, which need an account.
   const { tokenEndpoint } = PULLS;
   await expectChips(cardChips(page, roots.sessions), THREADS.sessions.pulls);
-  await cardChips(page, roots.sessions).nth(1).click();
+  await cardChips(page, roots.sessions, tokenEndpoint).click();
   await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(tokenEndpoint.title, {
     timeout: 30_000,
   });

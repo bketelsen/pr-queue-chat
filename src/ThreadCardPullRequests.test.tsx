@@ -6,7 +6,8 @@ import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import plugin from './index';
 import PullRequestPanel from './PullRequestPanel';
-import { pullRequestKey, refreshPullRequest } from './queries';
+import { pullRequestKey, refreshPullRequest, STALE_TIME } from './queries';
+import { FakeIntersectionObserver, observers, report } from './testing/intersectionObserver';
 import { linkedRoom, type TestLink, type TestWorktree } from './testing/linkedRoom';
 import { githubServer } from './testing/mindroomServer';
 import { ThreadCardPullRequests } from './ThreadCardPullRequests';
@@ -58,18 +59,26 @@ const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
 
 const show = async (
   room: Room,
-  { onParentClick = vi.fn(), phone = false }: { onParentClick?: () => void; phone?: boolean } = {}
+  {
+    onParentClick = vi.fn(),
+    phone = false,
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  }: { onParentClick?: () => void; phone?: boolean; client?: QueryClient } = {}
 ) => {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return renderPluginComponent(
+  const card = (room: Room) => (
     <QueryClientProvider client={client}>
       {/* The card's button, which opens the thread on a click that reaches it. */}
       <div data-testid="card" onClick={onParentClick}>
         <ThreadCardPullRequests room={room} threadId={THREAD} />
       </div>
-    </QueryClientProvider>,
-    { id: 'pull-requests', plugin, screenSize: phone ? 'Mobile' : 'Desktop' }
+    </QueryClientProvider>
   );
+  const view = await renderPluginComponent(card(room), {
+    id: 'pull-requests',
+    plugin,
+    screenSize: phone ? 'Mobile' : 'Desktop',
+  });
+  return { ...view, rerenderRoom: (room: Room) => view.rerender(card(room)) };
 };
 
 const chips = (view: Awaited<ReturnType<typeof show>>) =>
@@ -127,6 +136,7 @@ const proxiedSummaries = (mindroom: ReturnType<typeof githubServer>) =>
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   localStorage.clear();
+  observers.length = 0;
   page.panel = { isOpen: false, open: vi.fn() };
   page.panelReads = 0;
   page.navigateRoomThread.mockReset();
@@ -218,7 +228,8 @@ describe('ThreadCardPullRequests', () => {
       repo: 'sample-repo',
       number: i + 1,
     }));
-    const room = roomWith(links);
+    const hidden = { ...links[0]!, number: links.length + 1 };
+    const room = roomWith([...links, hidden]);
     let releaseSummaries = () => {};
     let releaseChecks = () => {};
     const summariesHeld = new Promise<void>((resolve) => (releaseSummaries = resolve));
@@ -226,7 +237,13 @@ describe('ThreadCardPullRequests', () => {
     const mindroom = githubServer(async (url) => {
       if (url.includes('/pulls/')) {
         await summariesHeld;
-        return Response.json({ title: 'Sample change', state: 'open', head: { sha: 'abc123' } });
+        const isHidden = url.endsWith(`/pulls/${hidden.number}`);
+        return Response.json({
+          title: 'Sample change',
+          state: 'open',
+          head: { sha: isHidden ? 'abc999' : 'abc123' },
+          updated_at: isHidden ? '2026-11-18T10:00:00Z' : '2026-11-19T10:00:00Z',
+        });
       }
       await checksHeld;
       if (url.includes('/check-runs?')) {
@@ -264,13 +281,59 @@ describe('ThreadCardPullRequests', () => {
       expect(client.isFetching()).toBe(0);
     });
     const requests = mindroom.githubRequests();
-    expect(requests).toHaveLength(3 * links.length);
+    expect(proxiedSummaries(mindroom)).toContain(hidden.number);
+    expect(requests).toHaveLength(3 * links.length + 1);
+    expect(requests.some(({ path }) => path.includes('/commits/abc999/'))).toBe(false);
     expect(requests.every(({ method }) => method === 'GET')).toBe(true);
     expect(
       mindroom.server.request.mock.calls.filter(
         ([path, init]) => path === '/api/github/request' && init?.method === 'POST'
       )
     ).toHaveLength(requests.length);
+  });
+
+  it('cancels a queued summary when only an unseen card still links to it', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    const slots = held();
+    const mindroom = githubServer(async () => {
+      await slots.reply;
+      return Response.json({ state: 'closed' });
+    });
+    roomServer.current = mindroom.server;
+    const links = [1, 2, 3, 4, 5, 5].map((number, index) => ({
+      ...sampleRef(number),
+      thread: `$sample${index + 1}`,
+    }));
+    const room = roomWith(links);
+    const client = new QueryClient();
+    client.setQueryData(['pull-requests-github-status', mindroom.server.origin], {
+      connected: true,
+      login: 'octo',
+      via: 'app',
+    });
+    const wave = (omitFifth = false) => (
+      <QueryClientProvider client={client}>
+        {links
+          .filter((_link, index) => !omitFifth || index !== 4)
+          .map(({ thread }) => (
+            <ThreadCardPullRequests key={thread} room={room} threadId={thread} />
+          ))}
+      </QueryClientProvider>
+    );
+    const view = await renderPluginComponent(wave(), { id: 'pull-requests', plugin });
+    try {
+      const rows = [...view.container.querySelectorAll('.mrpr-thread-card-chips')].slice(0, 5);
+      await act(async () => report(true, (target) => rows.includes(target)));
+      const fifth = { queryKey: pullRequestKey(sampleRef(5)) };
+      await vi.waitFor(() => expect(client.isFetching(fifth)).toBe(1));
+      expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4]);
+      view.rerender(wave(true));
+      expect(client.isFetching(fifth)).toBe(0);
+    } finally {
+      slots.release();
+    }
+    await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+    expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4]);
   });
 
   const interactiveSurfaces = ['side panel', 'thread actions menu', 'chip hover card'] as const;
@@ -420,6 +483,277 @@ describe('ThreadCardPullRequests', () => {
     });
     expect(chips(view).map((chip) => chip.textContent)).toEqual(['#1']);
     expect(view.getByRole('img', { name: '2 more pull requests' }).textContent).toBe('+2');
+  });
+
+  it.each([
+    { screen: 'a phone', phone: true, states: ['merged', 'open'], shown: ['#2'] },
+    { screen: 'desktop', phone: false, states: ['merged', 'closed', 'open'], shown: ['#3', '#2'] },
+  ])('shows open pull requests first on $screen', async ({ phone, states, shown }) => {
+    const links = states.map((_state, index) => ({ number: index + 1 }));
+    const mindroom = githubServer(async (url) => {
+      const [number] = summaryNumbers([url]);
+      const state = states[number! - 1];
+      return Response.json({
+        state: state === 'merged' ? 'closed' : state,
+        merged_at: state === 'merged' ? '2026-11-18T10:00:00Z' : null,
+      });
+    });
+    roomServer.current = mindroom.server;
+    const view = await show(roomWith(links), { phone });
+    await vi.waitFor(() => expect(chips(view).map((chip) => chip.textContent)).toEqual(shown));
+    expect(view.getByRole('img', { name: '1 more pull request' }).textContent).toBe('+1');
+    expect(proxiedSummaries(mindroom).toSorted((a, b) => a - b)).toEqual(
+      links.map(({ number }) => number)
+    );
+  });
+
+  it.each([1, 2])('keeps link order while a summary loads, then shows open #%s', async (open) => {
+    const first = held();
+    const mindroom = githubServer(async (url) => {
+      const [number] = summaryNumbers([url]);
+      if (number === 1) await first.reply;
+      return Response.json(
+        number === open ? { state: 'open' } : { state: 'closed', merged_at: '2026-11-18T10:00:00Z' }
+      );
+    });
+    roomServer.current = mindroom.server;
+    const client = new QueryClient();
+    const view = await show(roomWith([1, 2].map(sampleRef)), { phone: true, client });
+    const second = [...pullRequestKey(sampleRef(2)), `server:${mindroom.server.origin}:octo:0`];
+    try {
+      await vi.waitFor(() => expect(client.getQueryState(second)?.status).toBe('success'));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(chips(view).map((chip) => chip.textContent)).toEqual(['#1']);
+    } finally {
+      first.release();
+    }
+    await view.findByRole('img', { name: `Pull request mindroom-ai/sample-repo #${open}: Open` });
+  });
+
+  it('keeps link order when the first summary is uncached and paused offline', async () => {
+    localStorage.setItem(
+      'mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/githubToken',
+      'ghp_test'
+    );
+    const client = new QueryClient();
+    const first = [...pullRequestKey(sampleRef(1)), true];
+    client.setQueryData([...pullRequestKey(sampleRef(2)), true], { state: 'merged' });
+    try {
+      onlineManager.setOnline(false);
+      const view = await show(roomWith([1, 2].map(sampleRef)), { phone: true, client });
+      expect(client.getQueryState(first)).toMatchObject({
+        status: 'pending',
+        fetchStatus: 'paused',
+      });
+      expect(chips(view).map((chip) => chip.textContent)).toEqual(['#1']);
+    } finally {
+      onlineManager.setOnline(true);
+    }
+    await vi.waitFor(() => expect(client.getQueryState(first)?.fetchStatus).toBe('idle'));
+  });
+
+  it.each(['fetching', 'paused'])(
+    'uses stale cached order on remount while refreshes are %s',
+    async (fetchStatus) => {
+      const refresh = held();
+      let refreshing = false;
+      const mindroom = githubServer(async (url) => {
+        if (refreshing) await refresh.reply;
+        return Response.json(
+          url.endsWith('/pulls/1')
+            ? { state: 'closed', merged_at: '2026-11-18T10:00:00Z' }
+            : { state: 'open' }
+        );
+      });
+      roomServer.current = mindroom.server;
+      const client = new QueryClient();
+      const room = roomWith([1, 2].map(sampleRef));
+      const options = { phone: true, client };
+      const first = await show(room, options);
+      await first.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #2: Open' });
+      first.unmount();
+      await client.invalidateQueries({ queryKey: ['pull-requests', 'pr'], refetchType: 'none' });
+      const access = `server:${mindroom.server.origin}:octo:0`;
+      const keys = [1, 2].map((number) => [...pullRequestKey(sampleRef(number)), access]);
+      const statuses = () => keys.map((key) => client.getQueryState(key)?.fetchStatus);
+      try {
+        refreshing = true;
+        onlineManager.setOnline(fetchStatus !== 'paused');
+        const remount = await show(room, options);
+        await vi.waitFor(() => expect(statuses()).toEqual([fetchStatus, fetchStatus]));
+        expect(chips(remount).map((chip) => chip.textContent)).toEqual(['#2']);
+      } finally {
+        onlineManager.setOnline(true);
+        refresh.release();
+      }
+      await vi.waitFor(() => expect(statuses()).toEqual(['idle', 'idle']));
+    }
+  );
+
+  it('keeps the settled chip during paused and out-of-order summary refreshes', async () => {
+    const newer = held();
+    let refreshing = false;
+    const mindroom = githubServer(async (url) => {
+      const second = url.endsWith('/pulls/2');
+      if (second && refreshing) await newer.reply;
+      // Both refreshes are newer than the originals, and the second pull request has merged.
+      const day = (refreshing ? 18 : 16) + (second ? 2 : 1);
+      const updatedAt = `2026-11-${day}T10:00:00Z`;
+      const merged = second && refreshing;
+      return Response.json({
+        state: merged ? 'closed' : 'open',
+        updated_at: updatedAt,
+        merged_at: merged ? updatedAt : null,
+        title: refreshing ? 'Refreshed' : '',
+      });
+    });
+    roomServer.current = mindroom.server;
+    const client = new QueryClient();
+    const view = await show(roomWith([1, 2].map(sampleRef)), { phone: true, client });
+    const access = `server:${mindroom.server.origin}:octo:0`;
+    const olderKey = [...pullRequestKey(sampleRef(1)), access];
+    const newerKey = [...pullRequestKey(sampleRef(2)), access];
+    await view.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #2: Open' });
+    try {
+      refreshing = true;
+      await act(async () => {
+        onlineManager.setOnline(false);
+        await client.refetchQueries({ queryKey: ['pull-requests', 'pr'] });
+        // A newer cached answer would move #1 ahead of #2 if paused reads counted as settled.
+        client.setQueryData(olderKey, { state: 'open', updatedAt: '2026-11-18T12:00:00Z' });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect([olderKey, newerKey].map((key) => client.getQueryState(key)?.fetchStatus)).toEqual([
+        'paused',
+        'paused',
+      ]);
+      expect(chips(view).map((chip) => chip.textContent)).toEqual(['#2']);
+      await act(async () => onlineManager.setOnline(true));
+      await vi.waitFor(() =>
+        expect(client.getQueryData(olderKey)).toMatchObject({ updatedAt: '2026-11-19T10:00:00Z' })
+      );
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(client.getQueryState(newerKey)?.fetchStatus).toBe('fetching');
+      expect(chips(view).map((chip) => chip.textContent)).toEqual(['#2']);
+    } finally {
+      onlineManager.setOnline(true);
+      newer.release();
+    }
+    await view.findByRole('img', {
+      name: /Pull request mindroom-ai\/sample-repo #1: Open\s+Refreshed/,
+    });
+    expect(client.getQueryData(newerKey)).toMatchObject({ state: 'merged' });
+  });
+
+  it('keeps the settled chip while a newly linked summary loads', async () => {
+    const third = held();
+    const mindroom = githubServer(async (url) => {
+      const [number] = summaryNumbers([url]);
+      if (number === 1) {
+        return Response.json({ state: 'closed', merged_at: '2026-11-18T10:00:00Z' });
+      }
+      if (number === 3) {
+        await third.reply;
+        return Response.json({ state: 'open', updated_at: '2026-11-20T10:00:00Z' });
+      }
+      return Response.json({ state: 'open' });
+    });
+    roomServer.current = mindroom.server;
+    const view = await show(roomWith([1, 2].map(sampleRef)), { phone: true });
+    await view.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #2: Open' });
+    try {
+      view.rerenderRoom(roomWith([1, 2, 3].map(sampleRef)));
+      await vi.waitFor(() => expect(proxiedSummaries(mindroom)).toContain(3));
+      expect(chips(view).map((chip) => chip.textContent)).toEqual(['#2']);
+      view.rerenderRoom(roomWith([1, 3].map(sampleRef)));
+      expect(chips(view).map((chip) => chip.textContent)).toEqual(['#1']);
+    } finally {
+      third.release();
+    }
+    await view.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #3: Open' });
+  });
+
+  it('waits for the chip row to be on screen before reading hidden summaries', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    const mindroom = githubServer(async () => Response.json({ state: 'closed' }));
+    roomServer.current = mindroom.server;
+    const client = new QueryClient();
+    const view = await show(roomWith([1, 2].map(sampleRef)), { phone: true, client });
+    await vi.waitFor(() => expect(mindroom.statusRequests()).toBe(1));
+    await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+    expect(proxiedSummaries(mindroom)).toEqual([]);
+    const row = view.container.querySelector('.mrpr-thread-card-chips');
+    expect(row).not.toBeNull();
+    await act(async () => report(true, (target) => target === row));
+    await vi.waitFor(() => expect(proxiedSummaries(mindroom)).toEqual([1, 2]));
+    await act(async () => report(true));
+    await view.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #1: Closed' });
+    expect(proxiedSummaries(mindroom)).toEqual([1, 2]);
+  });
+
+  it.each([
+    { status: 404, priorAnswer: false },
+    { status: 404, priorAnswer: true },
+    { status: 502, priorAnswer: false },
+  ])(
+    'handles a hidden $status on remount and reconnect (prior answer: $priorAnswer)',
+    async ({ status, priorAnswer }) => {
+      let failing = true;
+      const mindroom = githubServer(async (url) =>
+        url.endsWith('/pulls/2') && failing
+          ? Response.json({}, { status })
+          : Response.json({ state: 'open' })
+      );
+      roomServer.current = mindroom.server;
+      const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
+      const key = [...pullRequestKey(sampleRef(2)), `server:${mindroom.server.origin}:octo:0`];
+      if (priorAnswer) {
+        client.setQueryData(key, { state: 'closed' }, { updatedAt: Date.now() - STALE_TIME - 1 });
+      }
+      const room = roomWith([1, 2].map(sampleRef));
+      const options = { phone: true, client };
+      const view = await show(room, options);
+      await vi.waitFor(() => expect(client.getQueryState(key)?.status).toBe('error'));
+      const hiddenReads = () => proxiedSummaries(mindroom).filter((number) => number === 2).length;
+      const expected = hiddenReads() + (status === 502 ? 1 : 0);
+      view.unmount();
+      failing = false;
+      await show(room, options);
+      await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+      expect(hiddenReads()).toBe(expected);
+      await act(async () => {
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+      });
+      await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+      expect(hiddenReads()).toBe(expected);
+    }
+  );
+
+  it('keeps anonymous link order and reads only the shown pull requests', async () => {
+    const client = new QueryClient();
+    client.setQueryData([...pullRequestKey(sampleRef(3)), false], { state: 'open' });
+    const first = held();
+    fetchMock.mockImplementation(async (url) => {
+      if (!url.endsWith('/pulls/1')) return Response.json({ state: 'open' });
+      await first.reply;
+      return Response.json({ state: 'closed', merged_at: '2026-11-18T10:00:00Z' });
+    });
+    const view = await show(roomWith([1, 2, 3, 4].map(sampleRef)), { client });
+    try {
+      expect(chips(view).map((chip) => chip.textContent)).toEqual(['#1', '#2']);
+      await view.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #2: Open' });
+      expect(chips(view).map((chip) => chip.textContent)).toEqual(['#1', '#2']);
+    } finally {
+      first.release();
+    }
+    await view.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #1: Merged' });
+    expect(chips(view).map((chip) => chip.textContent)).toEqual(['#1', '#2']);
+    expect(summaryNumbers(fetchMock.mock.calls.map(([url]) => url)).sort()).toEqual([1, 2]);
   });
 
   it('shows no count when every chip shows', async () => {
