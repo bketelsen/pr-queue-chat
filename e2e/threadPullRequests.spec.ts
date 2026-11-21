@@ -936,7 +936,7 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
   const box = (await stat.boundingBox())!;
   const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
   await page.mouse.move(x, y);
-  const tooltip = page.getByRole('dialog', { name: /^Lines changed/ });
+  const tooltip = page.getByRole('tooltip').filter({ has: page.locator('.mrpr-breakdown') });
   await expect(tooltip).toBeVisible();
   for (const dx of [-3, -1, 1, 3, 0]) {
     await page.mouse.move(x + dx, y);
@@ -949,6 +949,9 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
     ).toBe(true);
     await expect(tooltip).toHaveCount(1, { timeout: 0 });
   }
+  await stat.click();
+  await page.waitForTimeout(100);
+  expect(await tooltip.count()).toBe(1);
   await shot(page, 'lines-tooltip', { keepPointer: true });
   await page.mouse.move(0, 0);
   await expect(tooltip).toHaveCount(0);
@@ -981,6 +984,176 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
   expect(angles).toBeGreaterThan(10);
   expect(over).toBe(0);
   expect(unanswered).toEqual([]);
+});
+
+const linesStat = (page: Page) => panel(page).getByRole('button', { name: /^Lines changed/ });
+// Both the old dialog and the tooltip render this surface, so the regression catches either
+// unmounting or moving out of the viewport without depending on the role being fixed.
+const linesSurface = '.mrpr-popover-fit';
+
+const openLinesPanel = async (page: Page, input: 'tap' | 'click') => {
+  await openRoom(page);
+  await cardChips(page, roots.sessions).first()[input]();
+  const title = panel(page).locator('.mrpr-panel-title');
+  await expect(title).toHaveText(PULLS.sessionStore.title, { timeout: 30_000 });
+  return title;
+};
+
+/** Samples the actual popup from contact, even if Playwright waits before making that contact. */
+const sampleLinesPress = (stat: Locator) =>
+  stat.evaluateHandle((button, selector) => {
+    const done = new Promise<{ visible: number; missingAfterOpen: number } | null>((resolve) => {
+      const onContact = () => {
+        clearTimeout(contactTimeout);
+        const until = performance.now() + 1_500;
+        const frames = { visible: 0, missingAfterOpen: 0 };
+        const sample = () => {
+          const rect = document.querySelector(selector)?.getBoundingClientRect();
+          if (
+            rect &&
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.left >= 0 &&
+            rect.top >= 0 &&
+            rect.right <= innerWidth &&
+            rect.bottom <= innerHeight
+          ) {
+            frames.visible += 1;
+          } else if (frames.visible) {
+            frames.missingAfterOpen += 1;
+          }
+          if (performance.now() < until) requestAnimationFrame(sample);
+          else resolve(frames);
+        };
+        requestAnimationFrame(sample);
+      };
+      const contactTimeout = window.setTimeout(() => {
+        button.removeEventListener('pointerdown', onContact);
+        resolve(null);
+      }, 5_000);
+      button.addEventListener('pointerdown', onContact, { once: true });
+    });
+    return { done };
+  }, linesSurface);
+
+const holdLinesStat = async (page: Page, stat: Locator) => {
+  await stat.tap({ trial: true });
+  const box = (await stat.boundingBox())!;
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x: box.x + box.width / 2, y: box.y + box.height / 2 }],
+    });
+    // A short hold leaves enough time to see what pointerenter did before the finger lifts.
+    await page.waitForTimeout(100);
+    const openBeforeLift = await page.locator(linesSurface).count();
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    return openBeforeLift;
+  } finally {
+    await cdp.detach();
+  }
+};
+
+test('lines tooltip closes on Escape without sending focus to the composer', async ({ page }) => {
+  test.setTimeout(4 * 60_000);
+  const unanswered = await stubGitHub(page);
+  await openLinesPanel(page, 'click');
+  const stat = linesStat(page);
+  const surface = page.locator(linesSurface);
+  await stat.focus();
+  await expect(surface).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(surface).toHaveCount(0);
+  await expect(stat).toBeFocused();
+
+  // A hover has no focus to lose; Escape still closes it.
+  await panel(page).getByRole('tab', { name: 'Summary' }).focus();
+  await stat.hover();
+  await expect(stat).not.toBeFocused();
+  await expect(surface).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(surface).toHaveCount(0);
+  expect(unanswered).toEqual([]);
+});
+
+test.describe('phone lines tooltip', () => {
+  test.use(PHONE_CONTEXT);
+
+  for (const press of ['tap', 'hold'] as const) {
+    for (const delay of [0, 800]) {
+      test(`stays open after a ${press} with a ${delay} ms files response`, async ({
+        page,
+        browserName,
+      }) => {
+        test.skip(
+          press === 'hold' && browserName !== 'chromium',
+          'A separated touch start and end use CDP'
+        );
+        test.setTimeout(4 * 60_000);
+        const unanswered = await stubGitHub(page);
+        const pull = PULLS.sessionStore;
+        let requests = 0;
+        await page.route(
+          (url) => url.hostname === 'api.github.com' && url.pathname === `${pullPath(pull)}/files`,
+          async (route) => {
+            if (route.request().method() === 'OPTIONS') return route.fallback();
+            requests += 1;
+            if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+            await route.fulfill({
+              headers: CORS,
+              json: [
+                { filename: 'src/store.ts', status: 'modified', additions: 150, deletions: 30 },
+                { filename: 'src/store.test.ts', status: 'added', additions: 26, deletions: 0 },
+                { filename: 'README.md', status: 'modified', additions: 8, deletions: 7 },
+              ],
+            });
+          }
+        );
+        await openLinesPanel(page, 'tap');
+        const stat = linesStat(page);
+        const surface = page.locator(linesSurface);
+        expect(requests).toBe(0);
+        await expect(surface).toHaveCount(0);
+        const sampler = await sampleLinesPress(stat);
+        const openBeforeLift = press === 'hold' ? await holdLinesStat(page, stat) : 0;
+        if (press === 'tap') await stat.tap();
+        const frames = await sampler.evaluate(async ({ done }) => {
+          const frames = await done;
+          if (!frames) throw new Error('no pointerdown on stat');
+          return frames;
+        });
+        await sampler.dispose();
+        const { visible, missingAfterOpen } = frames;
+        expect(openBeforeLift, 'a held finger must not open the tooltip before the tap').toBe(0);
+        expect(visible).toBeGreaterThan(1);
+        expect(missingAfterOpen, 'frames missing after opening').toBe(0);
+        await expect(surface).toContainText('Total');
+        await shot(page, `after-${browserName}-${press}-${delay}`, { keepPointer: true });
+        expect(requests).toBe(1);
+        expect(unanswered).toEqual([]);
+      });
+    }
+  }
+
+  for (const dismiss of ['tap outside', 'second tap'] as const) {
+    test(`closes on a ${dismiss}`, async ({ page, browserName }) => {
+      test.setTimeout(4 * 60_000);
+      const unanswered = await stubGitHub(page);
+      const title = await openLinesPanel(page, 'tap');
+      const stat = linesStat(page);
+      const surface = page.locator(linesSurface);
+      await stat.tap();
+      await expect(surface).toContainText('Total');
+      await (dismiss === 'tap outside' ? title : stat).tap();
+      await expect(surface).toHaveCount(0);
+      if (dismiss === 'tap outside') {
+        await expect(title).toBeVisible();
+        await shot(page, `after-${browserName}-tap-outside`, { keepPointer: true });
+      }
+      expect(unanswered).toEqual([]);
+    });
+  }
 });
 
 test('the Code tab highlights a hunk inside a docstring and can expand its context', async ({
