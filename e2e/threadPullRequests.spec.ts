@@ -983,6 +983,97 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
   expect(unanswered).toEqual([]);
 });
 
+for (const delay of [0, 800]) {
+  test(`phone lines tooltip stays open after a tap with a ${delay} ms files response`, async ({
+    browser,
+    baseURL,
+  }) => {
+    test.setTimeout(4 * 60_000);
+    const context = await browser.newContext({ baseURL, ...PHONE_CONTEXT });
+    const page = await context.newPage();
+    try {
+      const unanswered = await stubGitHub(page);
+      const pull = PULLS.sessionStore;
+      let requests = 0;
+      await page.route(
+        (url) => url.hostname === 'api.github.com' && url.pathname === `${pullPath(pull)}/files`,
+        async (route) => {
+          if (route.request().method() === 'OPTIONS') return route.fallback();
+          requests += 1;
+          if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+          await route.fulfill({
+            headers: CORS,
+            json: [
+              { filename: 'src/store.ts', status: 'modified', additions: 150, deletions: 30 },
+              { filename: 'src/store.test.ts', status: 'added', additions: 26, deletions: 0 },
+              { filename: 'README.md', status: 'modified', additions: 8, deletions: 7 },
+            ],
+          });
+        }
+      );
+      await openRoom(page);
+      await cardChips(page, roots.sessions).first().tap();
+      await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(pull.title, {
+        timeout: 30_000,
+      });
+      const stat = panel(page).getByRole('button', { name: /^Lines changed/ });
+      const selector = '[aria-label^="Lines changed"] .mrpr-popover-fit';
+      const surface = page.locator(selector);
+      expect(requests).toBe(0);
+      await expect(surface).toHaveCount(0);
+
+      for (const tap of [1, 2]) {
+        const sampler = await stat.evaluateHandle((button, selector) => {
+          // Start watching before the click's default focus. A single visibility assertion could
+          // land on one of the visible frames and miss the tooltip disappearing on the next one.
+          let until = performance.now() + 5_000;
+          button.addEventListener(
+            'pointerdown',
+            () => {
+              until = performance.now() + 1_500;
+            },
+            { once: true }
+          );
+          const frames = { visible: 0, missingAfterOpen: 0 };
+          const done = new Promise<typeof frames>((resolve) => {
+            const sample = () => {
+              const rect = document.querySelector(selector)?.getBoundingClientRect();
+              if (
+                rect &&
+                rect.width > 0 &&
+                rect.height > 0 &&
+                rect.left >= 0 &&
+                rect.top >= 0 &&
+                rect.right <= innerWidth &&
+                rect.bottom <= innerHeight
+              ) {
+                frames.visible += 1;
+              } else if (frames.visible) {
+                frames.missingAfterOpen += 1;
+              }
+              if (performance.now() < until) requestAnimationFrame(sample);
+              else resolve(frames);
+            };
+            requestAnimationFrame(sample);
+          });
+          return { done };
+        }, selector);
+        await stat.tap();
+        const { visible, missingAfterOpen } = await sampler.evaluate(({ done }) => done);
+        await sampler.dispose();
+        expect(visible).toBeGreaterThan(1);
+        expect(missingAfterOpen, `frames missing after tap ${tap}`).toBe(0);
+        await expect(surface).toContainText('Total');
+      }
+      await shot(page, `phone-lines-${delay}`, { keepPointer: true });
+      expect(requests).toBe(1);
+      expect(unanswered).toEqual([]);
+    } finally {
+      await context.close();
+    }
+  });
+}
+
 test('the Code tab highlights a hunk inside a docstring and can expand its context', async ({
   page,
 }) => {
