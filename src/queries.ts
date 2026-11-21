@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   isCancelledError,
   useQueries,
@@ -11,6 +11,7 @@ import {
   fetchBehindBy,
   fetchChecks,
   fetchCommitFiles,
+  fetchDiffBlob,
   fetchCommits,
   fetchConversationComments,
   fetchHeadBranch,
@@ -325,3 +326,72 @@ export const useCommitFiles = (ref: PullRequestRef | undefined, sha: string, ena
   useRefQuery(ref, enabled && sha !== '', ['commit-files', sha], (r, token, signal) =>
     fetchCommitFiles(r, sha, token, signal)
   );
+
+// Bound background reads across panels.
+const MAX_BLOB_READS = 4;
+let blobReads = 0;
+const waitingBlobReads: (() => void)[] = [];
+
+async function withBlobRead(load: () => Promise<string | null>): Promise<string | null> {
+  if (blobReads < MAX_BLOB_READS) blobReads += 1;
+  else await new Promise<void>((start) => waitingBlobReads.push(start));
+  try {
+    return await load();
+  } finally {
+    const next = waitingBlobReads.shift();
+    if (next) next();
+    else blobReads -= 1;
+  }
+}
+
+const blobAnswers = (results: { data?: string | null }[]) => results.map(({ data }) => data);
+
+// Separate from PR/repository refreshes, but still under credential changes' namespace.
+const diffBlobKey = (ref: PullRequestRef, sha: string, access: AccessKey) =>
+  ['pull-requests', 'blob', lower(ref.owner), lower(ref.repo), sha, access] as const;
+
+export function useDiffBlobs(
+  ref: PullRequestRef,
+  shas: readonly string[],
+  enabledShas: ReadonlySet<string>
+): ReadonlyMap<string, string> {
+  const access = useGitHubAccess();
+  const client = useQueryClient();
+  const hasAccess = access.via !== undefined;
+  const active = hasAccess && !access.pending;
+  const watched = useMemo(() => (active ? [...enabledShas] : []), [active, enabledShas]);
+  const data = useQueries({
+    queries: watched.map((sha) => ({
+      queryKey: diffBlobKey(ref, sha, access.key),
+      queryFn: ({ signal }: { signal: AbortSignal }) =>
+        withBlobRead(async () => {
+          // Removing the last observer aborts the signal, including for work still queued.
+          signal.throwIfAborted();
+          const current = access.authFor(access.key);
+          if (current === undefined) throw new GitHubError('badToken', 0);
+          return fetchDiffBlob(ref, sha, current, signal);
+        }),
+      staleTime: Infinity,
+      // Keep small blobs (at most 128 KiB each) warm while their files are offscreen.
+      gcTime: 30 * 60 * 1000,
+      retry: false,
+      ...NO_FOCUS_REFETCH,
+    })),
+    combine: blobAnswers,
+  });
+  return useMemo(() => {
+    const contents = new Map<string, string>();
+    if (!hasAccess) return contents;
+    watched.forEach((sha, index) => {
+      const blob = data[index];
+      if (typeof blob === 'string') contents.set(sha, blob);
+    });
+    // Keep already hydrated files when they leave the window, without subscribing to them.
+    for (const sha of shas) {
+      if (contents.has(sha)) continue;
+      const blob = client.getQueryData<string | null>(diffBlobKey(ref, sha, access.key));
+      if (typeof blob === 'string') contents.set(sha, blob);
+    }
+    return contents;
+  }, [access.key, client, data, hasAccess, ref, shas, watched]);
+}

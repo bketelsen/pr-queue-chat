@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { greenhouseAfter, greenhousePatch, greenhousePath } from '../src/testing/greenhouseDiff';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { loginWithPassword } from '@mindroom/e2e/auth';
 import { createRoom } from '@mindroom/e2e/createRoom';
@@ -982,13 +983,73 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
   expect(unanswered).toEqual([]);
 });
 
+test('the Code tab highlights a hunk inside a docstring and can expand its context', async ({
+  page,
+}) => {
+  test.setTimeout(3 * 60_000);
+  const unanswered = await stubGitHub(page);
+  const pull = THREADS.sessions.pulls[0]!;
+  const api = `https://api.github.com/repos/acme/${pull.repo}`;
+  const blob = 'b'.repeat(40);
+  await page.route(`https://api.github.com${pullPath(pull)}/files?**`, (route) =>
+    route.fulfill({
+      headers: CORS,
+      json: [
+        {
+          filename: greenhousePath,
+          sha: blob,
+          status: 'modified',
+          additions: 2,
+          deletions: 2,
+          patch: greenhousePatch,
+        },
+      ],
+    })
+  );
+  let release!: () => void;
+  const partialIsVisible = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`${api}/git/blobs/${blob}`, async (route) => {
+    await partialIsVisible;
+    await route.fulfill({ headers: CORS, body: greenhouseAfter });
+  });
+  await openRoom(page);
+  await cardChips(page, roots.sessions).first().click();
+  const code = panel(page);
+  await code.getByRole('tab', { name: 'Code' }).click();
+  const lines = code.locator('[data-line]');
+  const literal = lines.getByText('"fern"', { exact: true }).first();
+  const prose = 'if a leaf is dry, move its pot.';
+  const docLine = lines.filter({ hasText: prose }).first();
+  const color = (token: Locator) => token.evaluate((element) => getComputedStyle(element).color);
+  await expect(docLine.getByText('if', { exact: true })).toBeVisible({ timeout: 30_000 });
+  const stringColor = await color(literal);
+  release();
+  await expect(docLine.getByText(prose, { exact: true })).toHaveCSS('color', stringColor);
+  const keyword = lines
+    .filter({ hasText: 'return COUNT + 2' })
+    .getByText('return', { exact: true });
+  await expect(keyword).not.toHaveCSS('color', stringColor);
+  const separator = code
+    .locator('[data-separator]')
+    .filter({ hasText: '6 unmodified lines' })
+    .first();
+  const expand = separator.locator('[data-expand-button]').first();
+  await expect(expand).toBeVisible();
+  await shot(page, 'after');
+  await expand.click();
+  await expect(lines.filter({ hasText: 'Guide to the greenhouse.' }).first()).toBeVisible();
+  await shot(page, 'expanded');
+  expect(unanswered).toEqual([]);
+});
+
 // One changed file, so that the Code tab has a diff and a file tree.
 const ZOOM_FILE = {
   filename: 'src/session/store.ts',
   status: 'modified',
   additions: 2,
   deletions: 1,
-  sha: 'f'.repeat(40),
   patch:
     "@@ -1,2 +1,3 @@\n import { Redis } from 'ioredis';\n-export const store = new Map();\n+export const store = new Redis();\n+export const ttl = 3600;",
 };

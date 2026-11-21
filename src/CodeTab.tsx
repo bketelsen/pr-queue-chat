@@ -7,7 +7,7 @@
 // a viewed mark; the toolbar counts the viewed files and holds the display controls.
 import { usePluginTranslation } from '@mindroom/client-sdk/core';
 import { IconButton, IconTooltip, useThemeKind } from '@mindroom/client-sdk/ui';
-import type { CodeViewDiffItem, CodeViewItem } from '@pierre/diffs';
+import type { CodeViewDiffItem, CodeViewItem, PostRenderPhase } from '@pierre/diffs';
 import type { CodeViewAnnotationArgs, CodeViewHandle } from '@pierre/diffs/react';
 import type { GitStatus } from '@pierre/trees';
 import {
@@ -52,8 +52,10 @@ import { orderDiffFilesLikeTree } from './diff/diffFileTree.logic';
 import { FileTreeColumn } from './diff/FileTreeColumn';
 import {
   DIFF_THEME_NAMES,
+  canHydrateDiff,
   fnv1a32,
   getRenderablePatch,
+  prepareFileDiff,
   resolveFileDiffPath,
 } from './diff/diffRendering';
 import { orderDiffFiles } from './diff/fileOrder.logic';
@@ -69,7 +71,7 @@ import {
 } from './github';
 import { GitHubErrorState } from './GitHubErrorState';
 import { PullRequestDiffStat, PullRequestMetaLine } from './presentation';
-import { useCommitFiles } from './queries';
+import { useCommitFiles, useDiffBlobs } from './queries';
 import type { ReviewThread } from './reviewThreads';
 import { pluginRootStyle } from './theme';
 
@@ -266,6 +268,26 @@ export function CodeTab({
   const prefs = useCodePrefs();
   const viewed = useViewedFiles(pullRequest);
   const [treeOpen, setTreeOpen] = useState(true);
+  const [nearViewport, setNearViewport] = useState<ReadonlySet<string>>(() => new Set());
+  // Pierre only mounts items in its virtualized window (visible rows plus overscan).
+  const onDiffRender = useCallback(
+    (
+      _node: HTMLElement,
+      _instance: unknown,
+      phase: PostRenderPhase,
+      { item }: { item: { id: string } }
+    ) => {
+      if (phase === 'update') return;
+      setNearViewport((previous) => {
+        if (previous.has(item.id) === (phase === 'mount')) return previous;
+        const next = new Set(previous);
+        if (phase === 'mount') next.add(item.id);
+        else next.delete(item.id);
+        return next;
+      });
+    },
+    []
+  );
   const viewerRef = useRef<CodeViewHandle<ThreadGroup, undefined>>(null);
   const rowsRef = useRef(new Map<string, HTMLElement>());
 
@@ -313,7 +335,13 @@ export function CodeTab({
     [markTexts, viewed]
   );
 
-  // The highlighted lines depend on the theme, so the parse that caches them carries it in its key.
+  const collapsedOf = useCallback(
+    (path: string) =>
+      isFileDiffCollapsed(foldKeyOf(path), folds.override, folds.choices, isViewedNow(path)),
+    [foldKeyOf, folds.override, folds.choices, isViewedNow]
+  );
+
+  // The highlighted lines depend on the theme, so the parse cache key carries it.
   const scope = `pull-request:${pullRequest.owner}/${pullRequest.repo}#${pullRequest.number}:${themeKind}`;
   const { ignoreWhitespace, hideTests } = prefs;
   const parsedFiles = useMemo(() => {
@@ -321,21 +349,57 @@ export function CodeTab({
       .map(filePatch)
       .filter((part): part is string => part !== null)
       .join('');
-    const parsed = getRenderablePatch(patch, scope, { ignoreWhitespace });
+    const parsed = getRenderablePatch(patch, scope);
     // T3 Code's order, then the tree's, so the list and the tree agree.
     return parsed?.kind === 'files' ? orderDiffFilesLikeTree(orderDiffFiles(parsed.files)) : [];
-  }, [viewFiles, scope, ignoreWhitespace]);
+  }, [viewFiles, scope]);
 
   const testPaths = useMemo(
     () => new Set((viewFiles ?? []).map((file) => file.path).filter(isTestFile)),
     [viewFiles]
   );
-  const shownDiffs = useMemo(
+  const shownPartialDiffs = useMemo(
     () =>
       hideTests
         ? parsedFiles.filter((fileDiff) => !testPaths.has(resolveFileDiffPath(fileDiff)))
         : parsedFiles,
     [parsedFiles, hideTests, testPaths]
+  );
+  const sourceByPath = useMemo(
+    () => new Map(viewFiles?.map((file) => [file.path, file])),
+    [viewFiles]
+  );
+  const targets = useMemo(
+    () =>
+      shownPartialDiffs.filter(canHydrateDiff).flatMap((diff) => {
+        const path = resolveFileDiffPath(diff);
+        const sha = sourceByPath.get(path)?.sha;
+        return sha ? [{ path, sha }] : [];
+      }),
+    [shownPartialDiffs, sourceByPath]
+  );
+  const shas = useMemo(() => [...new Set(targets.map(({ sha }) => sha))], [targets]);
+  const enabledShas = useMemo(
+    () =>
+      new Set(
+        targets.flatMap(({ path, sha }) =>
+          nearViewport.has(path) && !collapsedOf(path) ? [sha] : []
+        )
+      ),
+    [targets, nearViewport, collapsedOf]
+  );
+  const blobs = useDiffBlobs(pullRequest, shas, enabledShas);
+  const shownDiffs = useMemo(
+    () =>
+      shownPartialDiffs.map((file) => {
+        const source = sourceByPath.get(resolveFileDiffPath(file));
+        return prepareFileDiff(file, {
+          source,
+          blob: source?.sha ? blobs.get(source.sha) : undefined,
+          ignoreWhitespace,
+        });
+      }),
+    [shownPartialDiffs, sourceByPath, blobs, ignoreWhitespace]
   );
   const hiddenTests = hideTests ? testPaths.size : 0;
   // A file without a diff to show, as GitHub sends none for a binary or a very large file.
@@ -361,12 +425,7 @@ export function CodeTab({
       shownDiffs.map((fileDiff) => {
         const path = resolveFileDiffPath(fileDiff);
         const annotations = placed.annotations.get(path) ?? [];
-        const collapsed = isFileDiffCollapsed(
-          foldKeyOf(path),
-          folds.override,
-          folds.choices,
-          isViewedNow(path)
-        );
+        const collapsed = collapsedOf(path);
         return {
           id: path,
           type: 'diff',
@@ -381,7 +440,7 @@ export function CodeTab({
           ),
         };
       }),
-    [shownDiffs, placed, folds.override, folds.choices, foldKeyOf, isViewedNow]
+    [shownDiffs, placed, collapsedOf]
   );
   const statusByPath = useMemo(
     () => new Map((viewFiles ?? []).map((file) => [file.path, treeStatus(file.status)])),
@@ -463,8 +522,7 @@ export function CodeTab({
       return patch === undefined ? undefined : viewed.stateOf(path, patch);
     },
     setViewed,
-    foldedOf: (path) =>
-      isFileDiffCollapsed(foldKeyOf(path), folds.override, folds.choices, isViewedNow(path)),
+    foldedOf: collapsedOf,
     toggleFolded,
   };
   const allFolded = areAllDiffFilesCollapsed(
@@ -705,6 +763,7 @@ export function CodeTab({
                   overflow: prefs.wrap ? 'wrap' : 'scroll',
                   lineDiffType: 'none',
                   stickyHeaders: true,
+                  onPostRender: onDiffRender,
                 }}
                 renderCodeViewFooter={renderWithoutDiff}
                 renderHeaderPrefix={renderHeaderPrefix}

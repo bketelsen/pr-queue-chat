@@ -8,6 +8,7 @@ import {
   fetchBehindBy,
   fetchChecks,
   fetchCommitFiles,
+  fetchDiffBlob,
   fetchCommits,
   fetchConversationComments,
   fetchHeadBranch,
@@ -898,6 +899,179 @@ describe('the lists', () => {
     );
     vi.stubGlobal('fetch', fetchMock);
     expect((await fetchReviews(ref, undefined)).truncated).toBe(false);
+  });
+});
+
+describe('fetchDiffBlob', () => {
+  const sha = 'b'.repeat(40);
+  const blobPath = `/repos/a/b/git/blobs/${sha}`;
+  const rawMedia = 'application/vnd.github.raw+json';
+  const proxy = (answer: () => unknown) => {
+    const request = vi.fn(async (_path: string, _init?: RequestInit) => answer());
+    return {
+      server: {
+        origin: 'https://meadow.example.org',
+        request: request as MindroomServer['request'],
+      },
+      account: 'gardener',
+      disconnected: vi.fn(),
+      unreadable: vi.fn(),
+      request,
+    };
+  };
+
+  it('downloads one bounded raw blob through MindRoom and preserves its text', async () => {
+    const text = '\uFEFFé\n';
+    const via = proxy(() => ({ status: 200, body: text }));
+    await expect(fetchDiffBlob(ref, sha, via)).resolves.toBe(text);
+    expect(via.request).toHaveBeenCalledOnce();
+    const [path, init] = via.request.mock.calls[0]!;
+    expect(path).toBe('/api/github/request');
+    expect(init?.method).toBe('POST');
+    expect(JSON.parse(String(init?.body))).toEqual({
+      method: 'GET',
+      path: blobPath,
+      accept: rawMedia,
+      max_bytes: 128 * 1024,
+    });
+  });
+
+  it.each([
+    [502, 'github_response_too_large'],
+    [502, 'github_response_not_text'],
+    [422, 'github_request_invalid'],
+  ])('leaves the patch alone on MindRoom %d %s', async (status, error) => {
+    const via = proxy(() => {
+      throw new MindroomServerError('Proxy refusal', status, { error });
+    });
+    await expect(fetchDiffBlob(ref, sha, via)).resolves.toBeNull();
+    expect(via.request).toHaveBeenCalledOnce();
+  });
+
+  it.each(['bud\0\n', 'version https://git-lfs.github.com/spec/v1\n'])(
+    'rejects unsupported proxy text %j',
+    async (body) => {
+      await expect(
+        fetchDiffBlob(
+          ref,
+          sha,
+          proxy(() => ({ status: 200, body }))
+        )
+      ).resolves.toBeNull();
+    }
+  );
+
+  it('leaves the patch alone when the proxy relays GitHub 404', async () => {
+    await expect(
+      fetchDiffBlob(
+        ref,
+        sha,
+        proxy(() => ({ status: 404, body: null }))
+      )
+    ).resolves.toBeNull();
+  });
+
+  it('rejects other proxy failures rather than caching no blob', async () => {
+    const broken = proxy(() => {
+      throw new MindroomServerError('Proxy failure', 502, { error: 'github_unreachable' });
+    });
+    const offline = proxy(() => {
+      throw new TypeError('Failed to fetch');
+    });
+    const upstream = proxy(() => ({ status: 503, body: null }));
+    for (const [via, status] of [
+      [broken, 0],
+      [offline, 0],
+      [upstream, 503],
+    ] as const) {
+      await expect(fetchDiffBlob(ref, sha, via)).rejects.toMatchObject({ kind: 'failed', status });
+    }
+  });
+
+  it('throws on a GitHub rate limit relayed by MindRoom and suppresses the next download', async () => {
+    vi.useFakeTimers({ now: Date.UTC(2026, 0, 1), toFake: ['Date'] });
+    try {
+      const via = proxy(() => ({ status: 403, headers: { 'x-ratelimit-remaining': '0' } }));
+      await expect(fetchDiffBlob(ref, sha, via)).rejects.toMatchObject({ kind: 'rateLimited' });
+      await expect(fetchDiffBlob(ref, sha, via)).rejects.toMatchObject({ kind: 'rateLimited' });
+      expect(via.request).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads small raw UTF-8 directly with the token', async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response('é\n'));
+    vi.stubGlobal('fetch', fetchMock);
+    expect(await fetchDiffBlob(ref, sha, 'blob-fixture')).toBe('é\n');
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({ Accept: rawMedia });
+  });
+
+  it.each([true, false])('cancels an oversized stream (length header: %s)', async (withLength) => {
+    const max = 128 * 1024;
+    let reads = 0;
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          reads += 1;
+          const size = reads === 1 ? max : 1;
+          if (reads === 3) controller.close();
+          else controller.enqueue(new Uint8Array(size).fill(0x61));
+        },
+        cancel,
+      },
+      { highWaterMark: 0 }
+    );
+    const headers = withLength ? { 'content-length': String(max + 1) } : undefined;
+    const fetchMock = stubRoutes({ '/git/blobs/': new Response(body, { headers }) });
+    expect(await fetchDiffBlob(ref, sha, 'blob-fixture')).toBeNull();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(reads).toBe(withLength ? 0 : 2);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['404 (including submodule commit IDs)', new Response(null, { status: 404 })],
+    ['binary data with a NUL', new Response(Uint8Array.of(0, 97))],
+    ['invalid UTF-8', new Response(Uint8Array.of(0xff))],
+    ['an LFS pointer', new Response('version https://git-lfs.github.com/spec/v1\n')],
+  ])('falls back permanently on %s', async (_case, body) => {
+    stubRoutes({ '/git/blobs/': body });
+    expect(await fetchDiffBlob(ref, sha, 'blob-fixture')).toBeNull();
+  });
+
+  it.each([403, 502])('rejects HTTP %d instead of caching no content', async (status) => {
+    stubRoutes({ '/git/blobs/': new Response(null, { status }) });
+    await expect(fetchDiffBlob(ref, sha, 'blob-fixture')).rejects.toMatchObject({ status });
+  });
+
+  it('rejects a network failure instead of caching no content', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+    await expect(fetchDiffBlob(ref, sha, 'blob-fixture')).rejects.toMatchObject({ status: 0 });
+  });
+
+  it.each([
+    ['with Retry-After', new Response(null, { status: 403, headers: { 'retry-after': '60' } })],
+    [
+      'without Retry-After',
+      json({ message: 'You have exceeded a secondary rate limit.' }, { status: 403 }),
+    ],
+  ])('rejects the same SHA during cooldown %s and reads it after reset', async (label, answer) => {
+    const token = `limited-blob-fixture-${label}`;
+    vi.useFakeTimers({ now: Date.UTC(2026, 0, 1), toFake: ['Date'] });
+    try {
+      const fetchMock = stubRoutes({ '/git/blobs/': answer });
+      await expect(fetchDiffBlob(ref, sha, token)).rejects.toMatchObject({ kind: 'rateLimited' });
+      await expect(fetchDiffBlob(ref, sha, token)).rejects.toMatchObject({ kind: 'rateLimited' });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      vi.setSystemTime(Date.now() + 60_000);
+      fetchMock.mockImplementation(async () => new Response('bud\n'));
+      await expect(fetchDiffBlob(ref, sha, token)).resolves.toBe('bud\n');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

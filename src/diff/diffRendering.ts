@@ -1,7 +1,13 @@
 // Ported from T3 Code (https://github.com/pingdotgg/t3code, apps/web/src/lib/diffRendering.ts at 8ab427c6), MIT, Copyright (c) 2026 T3 Tools Inc. See NOTICE.
 // Patch parsing, whitespace hiding and the diff surface's theme, the part of T3 Code's diff
 // rendering the Code tab uses.
-import { parseDiffFromFile, parsePatchFiles, type FileDiffMetadata } from '@pierre/diffs';
+import {
+  hydratePartialDiff,
+  parseDiffFromFile,
+  parsePatchFiles,
+  type FileDiffMetadata,
+} from '@pierre/diffs';
+import { GIT_LFS_POINTER_HEADER, MAX_DIFF_BLOB_BYTES, type DiffSource } from './diffSource';
 
 export const DIFF_THEME_NAMES = {
   light: 'pierre-light',
@@ -62,8 +68,171 @@ export function getDiffLineStat(files: ReadonlyArray<FileDiffMetadata>): DiffLin
   );
 }
 
-interface RenderablePatchOptions {
-  ignoreWhitespace?: boolean;
+export function canHydrateDiff(file: FileDiffMetadata): boolean {
+  return (
+    file.isPartial &&
+    file.hunks.length > 0 &&
+    (file.type === 'change' || file.type === 'rename-changed')
+  );
+}
+
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$/;
+const NO_NEWLINE = '\\ No newline at end of file';
+
+/** Reverse a complete GitHub patch against its own new blob. Never trust Pierre's repaired counts. */
+export function reconstructOldFile(
+  file: FileDiffMetadata,
+  source: DiffSource,
+  blob: string
+): string | null {
+  const rawHunks = source.patch?.split(/(?=^@@ )/m);
+  if (!rawHunks || file.hunks.length === 0 || rawHunks.length !== file.hunks.length) return null;
+  const lines = blob === '' ? [] : blob.split(/(?<=\n)/);
+  const old: string[] = [];
+  let oldEnd = 0;
+  let newEnd = 0;
+  let additions = 0;
+  let deletions = 0;
+  let oldEOF = false;
+  let newEOF = false;
+
+  for (const [index, raw] of rawHunks.entries()) {
+    const [header = '', ...rows] = raw.split('\n');
+    if (rows.at(-1) === '') rows.pop();
+    const match = HUNK_HEADER.exec(header);
+    if (!match) return null;
+    const oldAt = Number(match[1]);
+    const oldCount = Number(match[2] ?? 1);
+    const newAt = Number(match[3]);
+    const newCount = Number(match[4] ?? 1);
+    const hunk = file.hunks[index]!;
+    if (
+      ![oldAt, oldCount, newAt, newCount].every(Number.isSafeInteger) ||
+      oldAt !== hunk.deletionStart ||
+      oldCount !== hunk.deletionCount ||
+      newAt !== hunk.additionStart ||
+      newCount !== hunk.additionCount
+    )
+      return null;
+
+    // With no lines on a side, the header names the line before the change.
+    const oldStart = oldAt - (oldCount === 0 ? 0 : 1);
+    const newStart = newAt - (newCount === 0 ? 0 : 1);
+    const gap = newStart - newEnd;
+    if (
+      gap < 0 ||
+      gap !== oldStart - oldEnd ||
+      newStart + newCount > lines.length ||
+      (oldEOF && gap + oldCount > 0) ||
+      (newEOF && gap + newCount > 0)
+    )
+      return null;
+    if (gap > 0 && !lines[newStart - 1]?.endsWith('\n')) oldEOF = true;
+    if (oldEOF && oldCount > 0) return null;
+    old.push(lines.slice(newEnd, newStart).join(''));
+
+    let oldRows = 0;
+    let newRows = 0;
+    let oldMarker = false;
+    let newMarker = false;
+    for (let row = 0; row < rows.length; row += 1) {
+      const line = rows[row]!;
+      const sign = line[0];
+      if (sign !== ' ' && sign !== '+' && sign !== '-') return null;
+      const hasMarker = rows[row + 1] === NO_NEWLINE;
+      const text = line.slice(1) + (hasMarker ? '' : '\n');
+      if (sign !== '+') {
+        if (
+          oldEOF ||
+          oldRows >= oldCount ||
+          text === '' ||
+          text.includes('\0') ||
+          file.deletionLines[hunk.deletionLineIndex + oldRows] !== text
+        )
+          return null;
+        old.push(text);
+        oldRows += 1;
+        oldMarker = oldEOF = hasMarker;
+      }
+      if (sign !== '-') {
+        if (
+          newEOF ||
+          newRows >= newCount ||
+          lines[newStart + newRows] !== text ||
+          file.additionLines[hunk.additionLineIndex + newRows] !== text
+        )
+          return null;
+        newRows += 1;
+        newMarker = newEOF = hasMarker;
+      }
+      if (sign === '+') additions += 1;
+      if (sign === '-') deletions += 1;
+      if (hasMarker) row += 1;
+    }
+    if (
+      oldRows !== oldCount ||
+      newRows !== newCount ||
+      oldMarker !== hunk.noEOFCRDeletions ||
+      newMarker !== hunk.noEOFCRAdditions
+    )
+      return null;
+    oldEnd = oldStart + oldCount;
+    newEnd = newStart + newCount;
+  }
+
+  if (
+    additions !== source.additions ||
+    deletions !== source.deletions ||
+    ((oldEOF || newEOF) && newEnd !== lines.length)
+  )
+    return null;
+  old.push(lines.slice(newEnd).join(''));
+  const contents = old.join('');
+  // Lines only present in the old patch are not covered by the new blob's checks.
+  if (contents.startsWith(GIT_LFS_POINTER_HEADER)) return null;
+  return new TextEncoder().encode(contents).length <= MAX_DIFF_BLOB_BYTES ? contents : null;
+}
+
+type Preparation = { ignoreWhitespace?: boolean; source?: DiffSource; blob?: string };
+type Prepared = { source?: DiffSource; blob?: string; result: FileDiffMetadata };
+const preparedByFile = new WeakMap<FileDiffMetadata, Map<boolean, Prepared>>();
+
+export function prepareFileDiff(
+  file: FileDiffMetadata,
+  { source, blob, ignoreWhitespace = false }: Preparation = {}
+): FileDiffMetadata {
+  let prepared = preparedByFile.get(file);
+  if (prepared === undefined) {
+    prepared = new Map();
+    preparedByFile.set(file, prepared);
+  }
+  const cached = prepared.get(ignoreWhitespace);
+  if (cached && cached.source === source && cached.blob === blob) return cached.result;
+
+  let result = file;
+  if (source?.sha && blob !== undefined && canHydrateDiff(file)) {
+    try {
+      const old = reconstructOldFile(file, source, blob);
+      if (old !== null) {
+        result = hydratePartialDiff('clone', file, {
+          oldFile: { name: file.prevName ?? file.name, contents: old },
+          newFile: { name: file.name, contents: blob },
+        });
+        result.cacheKey = `${result.cacheKey ?? file.name}:${source.sha}`;
+      }
+    } catch {
+      // The original GitHub patch stays usable even if Pierre cannot hydrate it.
+    }
+  }
+  if (ignoreWhitespace) {
+    try {
+      result = hideWhitespaceChanges(result);
+    } catch {
+      // If filtering fails, show the unfiltered diff.
+    }
+  }
+  prepared.set(ignoreWhitespace, { source, blob, result });
+  return result;
 }
 
 function hideWhitespaceChanges(file: FileDiffMetadata): FileDiffMetadata {
@@ -121,8 +290,7 @@ function hideWhitespaceChanges(file: FileDiffMetadata): FileDiffMetadata {
 
 export function getRenderablePatch(
   patch: string | undefined,
-  cacheScope = 'diff-panel',
-  options: RenderablePatchOptions = {}
+  cacheScope = 'diff-panel'
 ): RenderablePatch | null {
   if (!patch?.trim()) return null;
 
@@ -130,8 +298,7 @@ export function getRenderablePatch(
     const parsedPatches = parsePatchFiles(patch, {
       cacheKeyPrefix: buildPatchCacheKey(patch, cacheScope),
     });
-    const sourceFiles = parsedPatches.flatMap((parsedPatch) => parsedPatch.files);
-    const files = options.ignoreWhitespace ? sourceFiles.map(hideWhitespaceChanges) : sourceFiles;
+    const files = parsedPatches.flatMap((parsedPatch) => parsedPatch.files);
     if (files.length > 0) {
       return { kind: 'files', files };
     }

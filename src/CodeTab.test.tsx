@@ -2,14 +2,24 @@
 import { useState, type ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act } from 'react-dom/test-utils';
+import type { MindroomServer } from '@mindroom/client-sdk/server';
 import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { GitHubError, type Commit, type PullRequestFile, type ReviewComment } from './github';
+import {
+  GitHubError,
+  type Commit,
+  type PullRequestRef,
+  type PullRequestFile,
+  type ReviewComment,
+} from './github';
 import plugin from './index';
 import type { ReviewThread } from './reviewThreads';
 import { CodeTab, type ListState } from './CodeTab';
 import { fnv1a32 } from './diff/diffRendering';
 import { trapOptions } from './testing/focusTrapStandIn';
+import { greenhouseAfter, greenhousePatch, greenhousePath } from './testing/greenhouseDiff';
+import { githubServer } from './testing/mindroomServer';
+import { GitHubServerContext } from './token';
 
 vi.mock('focus-trap-react', async () => ({
   default: (await import('./testing/focusTrapStandIn')).FocusTrapStandIn,
@@ -32,7 +42,11 @@ const view = vi.hoisted(() => ({
 vi.mock('@pierre/diffs/react', async () => {
   const { forwardRef, useImperativeHandle } = await import('react');
   type Annotation = { side: string; lineNumber: number };
-  type Item = { id: string; fileDiff: { name: string }; annotations?: Annotation[] };
+  type Item = {
+    id: string;
+    fileDiff: { name: string; isPartial: boolean };
+    annotations?: Annotation[];
+  };
   type Props = {
     items: Item[];
     renderCodeViewFooter?: () => ReactNode;
@@ -52,7 +66,10 @@ vi.mock('@pierre/diffs/react', async () => {
         <div data-testid="diff-view">
           <ol aria-label="Diffs">
             {props.items.map((item) => (
-              <li key={item.id}>
+              <li
+                key={item.id}
+                data-testid={`${item.fileDiff.isPartial ? 'partial' : 'complete'}:${item.id}`}
+              >
                 {item.fileDiff.name}
                 <div data-testid={`header:${item.id}`}>
                   {props.renderHeaderPrefix?.(item)}
@@ -284,6 +301,7 @@ const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
 const commitRequests = () => fetchMock.mock.calls.filter(([url]) => url.includes('/commits/'));
 
 type Options = {
+  pullRequest?: PullRequestRef;
   themeKind?: 'light' | 'dark';
   files?: PullRequestFile[];
   threads?: ListState<ReviewThread>;
@@ -295,6 +313,7 @@ type Options = {
 
 // The panel keeps the chosen commit; this stands in for it.
 function Holder({
+  pullRequest = REF,
   files,
   threads,
   commits,
@@ -305,7 +324,7 @@ function Holder({
   const [chosen, setChosen] = useState(initial);
   return (
     <CodeTab
-      pullRequest={REF}
+      pullRequest={pullRequest}
       files={files ?? FILES}
       threads={threads ?? loaded<ReviewThread>([])}
       commits={commits ?? loaded(COMMITS)}
@@ -317,11 +336,16 @@ function Holder({
   );
 }
 
-const show = ({ themeKind, commit, ...options }: Options = {}) => {
-  const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
+const show = (
+  { themeKind, commit, ...options }: Options = {},
+  client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } }),
+  server?: MindroomServer
+) => {
   return renderPluginComponent(
     <QueryClientProvider client={client}>
-      <Holder {...options} initial={commit} />
+      <GitHubServerContext.Provider value={{ server, pending: false }}>
+        <Holder {...options} initial={commit} />
+      </GitHubServerContext.Provider>
     </QueryClientProvider>,
     { id: 'pull-requests', plugin, themeKind: themeKind ?? 'light' }
   );
@@ -420,6 +444,255 @@ afterEach(() => {
 });
 
 describe('CodeTab', () => {
+  describe('blob hydration', () => {
+    const request = { owner: 'meadow-labs', repo: 'seedling-demo', number: 17 };
+    const sha = 'a'.repeat(40);
+    const otherSha = 'b'.repeat(40);
+    const endpoint = `https://api.github.com/repos/${request.owner}/${request.repo}/git/blobs/`;
+    const tokenKey = 'mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/githubToken';
+    const markKey = `mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/viewed:${request.owner}/${request.repo}#${request.number}`;
+    const testFile = file({
+      path: greenhousePath,
+      sha,
+      patch: greenhousePatch,
+      additions: 2,
+      deletions: 2,
+    });
+    const other = file({ ...testFile, path: 'seedlings.py', sha: otherSha });
+    const blobCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => url.includes('/git/blobs/')).map(([url]) => url);
+    const response = (text = greenhouseAfter) => new Response(text);
+    const blobKey = (sha: string) => [
+      'pull-requests',
+      'blob',
+      request.owner,
+      request.repo,
+      sha,
+      true,
+    ];
+    // The real viewer only post-renders the items in its virtual window.
+    const setInWindow = (path: string, phase: 'mount' | 'unmount' = 'mount') =>
+      act(async () => {
+        const postRender = options().onPostRender as (
+          node: HTMLElement,
+          instance: unknown,
+          phase: string,
+          state: { item: ShownItem }
+        ) => void;
+        postRender?.(document.createElement('div'), null, phase, { item: itemOf(path)! });
+      });
+
+    it('loads only the files entry’s blob in the All commits view', async () => {
+      localStorage.setItem(tokenKey, 'e2e-token');
+      fetchMock.mockImplementation(async (url) =>
+        url === endpoint + sha ? response() : respond({}, 404)
+      );
+      const tab = await show({ files: [testFile], pullRequest: request });
+      expect(tab.getByTestId(`partial:${greenhousePath}`)).toBeTruthy();
+      expect(fetchMock).not.toHaveBeenCalled();
+      await setInWindow(greenhousePath);
+      expect(await tab.findByTestId(`complete:${greenhousePath}`)).toBeTruthy();
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([endpoint + sha]);
+    });
+
+    it('uses the selected commit’s file blob without fetching a parent or a separate path', async () => {
+      localStorage.setItem(tokenKey, 'e2e-token');
+      const shaOfCommit = commit(2).sha;
+      fetchMock.mockImplementation(async (url) => {
+        if (url.endsWith(`/commits/${shaOfCommit}`))
+          return respond({
+            files: [
+              {
+                filename: greenhousePath,
+                previous_filename: 'orchard.py',
+                status: 'renamed',
+                sha,
+                additions: 2,
+                deletions: 2,
+                patch: greenhousePatch,
+              },
+            ],
+          });
+        return url === endpoint + sha ? response() : respond({}, 404);
+      });
+      const tab = await show({ commit: shaOfCommit, pullRequest: request });
+      await tab.findByTestId(`partial:${greenhousePath}`);
+      await setInWindow(greenhousePath);
+      expect(await tab.findByTestId(`complete:${greenhousePath}`)).toBeTruthy();
+      expect(blobCalls()).toEqual([endpoint + sha]);
+    });
+
+    it('does not fetch a viewed and folded file until it is unfolded', async () => {
+      localStorage.setItem(tokenKey, 'e2e-token');
+      localStorage.setItem(markKey, JSON.stringify({ [greenhousePath]: fnv1a32(greenhousePatch) }));
+      fetchMock.mockImplementation(async () => response());
+      const tab = await show({ files: [testFile, other], pullRequest: request });
+      expect(itemOf(greenhousePath)?.collapsed).toBe(true);
+      await setInWindow(greenhousePath);
+      await setInWindow(other.path);
+      await tab.findByTestId(`complete:${other.path}`);
+      expect(blobCalls()).toEqual([endpoint + otherSha]);
+      await click(foldToggle(tab, greenhousePath));
+      await tab.findByTestId(`complete:${greenhousePath}`);
+      expect(blobCalls()).toEqual([endpoint + otherSha, endpoint + sha]);
+    });
+
+    const observedBlobs = (client: QueryClient) =>
+      client
+        .getQueryCache()
+        .findAll({ queryKey: ['pull-requests', 'blob'] })
+        .flatMap((query) => (query.getObserversCount() > 0 ? [query.queryKey] : []));
+
+    it('leaves anonymous files patch-only with no blob observers even in the virtual window', async () => {
+      const client = new QueryClient();
+      const tab = await show({ files: [testFile], pullRequest: request }, client);
+      await setInWindow(greenhousePath);
+      expect(tab.getByTestId(`partial:${greenhousePath}`)).toBeTruthy();
+      expect(blobCalls()).toEqual([]);
+      expect(observedBlobs(client)).toEqual([]);
+    });
+
+    it('observes only eligible blobs in the virtual window and keeps hydrated diffs after scrolling out', async () => {
+      localStorage.setItem(tokenKey, 'e2e-token');
+      const client = new QueryClient();
+      const folded = file({ ...testFile, path: 'folded.py', sha: 'c'.repeat(40) });
+      localStorage.setItem(markKey, JSON.stringify({ [folded.path]: fnv1a32(greenhousePatch) }));
+      fetchMock.mockImplementation(async () => response());
+      const tab = await show({ files: [testFile, other, folded], pullRequest: request }, client);
+      expect(observedBlobs(client)).toEqual([]);
+      await setInWindow(folded.path);
+      await setInWindow(greenhousePath);
+      await tab.findByTestId(`complete:${greenhousePath}`);
+      expect(observedBlobs(client)).toEqual([blobKey(sha)]);
+      const hydrated = itemOf(greenhousePath)!.fileDiff;
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        await setInWindow(greenhousePath, 'unmount');
+        expect(observedBlobs(client)).toEqual([]);
+        expect(itemOf(greenhousePath)!.fileDiff).toBe(hydrated);
+        await act(async () => vi.advanceTimersByTimeAsync(29 * 60 * 1000));
+        expect(client.getQueryData(blobKey(sha))).toBe(greenhouseAfter);
+        await setInWindow(greenhousePath);
+        expect(itemOf(greenhousePath)!.fileDiff).toBe(hydrated);
+        expect(tab.getByTestId(`complete:${greenhousePath}`)).toBeTruthy();
+        expect(blobCalls()).toEqual([endpoint + sha]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('caps reads at four and skips a queued file that leaves the window', async () => {
+      localStorage.setItem(tokenKey, 'e2e-token');
+      const files = Array.from({ length: 6 }, (_, index) =>
+        file({
+          ...testFile,
+          path: `bed_${index}.py`,
+          sha: `${index + 1}`.repeat(40),
+        })
+      );
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      fetchMock.mockImplementation(async () => {
+        await waiting;
+        return response();
+      });
+      const client = new QueryClient();
+      const tab = await show({ files, pullRequest: request }, client);
+      const skipped = files[4]!;
+      for (const entry of files) await setInWindow(entry.path);
+      expect(blobCalls()).toEqual(files.slice(0, 4).map(({ sha }) => endpoint + sha));
+      await setInWindow(skipped.path, 'unmount');
+      await act(async () => release());
+      await tab.findByTestId(`complete:${files[5]!.path}`);
+      expect(client.getQueryState(blobKey(skipped.sha!))).toMatchObject({
+        fetchStatus: 'idle',
+        status: 'pending',
+      });
+      expect(blobCalls()).toEqual(
+        [...files.slice(0, 4), files[5]!].map(({ sha }) => endpoint + sha)
+      );
+    });
+
+    it('hydrates a diff with one raw blob request through MindRoom', async () => {
+      const upstream = githubServer(async (url) =>
+        url === endpoint + sha ? response() : respond({}, 404)
+      );
+      const tab = await show(
+        { files: [testFile], pullRequest: request },
+        new QueryClient(),
+        upstream.server
+      );
+      await setInWindow(greenhousePath);
+      expect(await tab.findByTestId(`complete:${greenhousePath}`)).toBeTruthy();
+      expect(upstream.githubRequests()).toEqual([
+        {
+          path: new URL(endpoint + sha).pathname,
+          method: 'GET',
+          accept: 'application/vnd.github.raw+json',
+          max_bytes: 128 * 1024,
+        },
+      ]);
+    });
+
+    it('hydrates the same SHA when re-enabled after a rate limit resets', async () => {
+      localStorage.setItem(tokenKey, 'retry-blob-fixture');
+      const now = vi.spyOn(Date, 'now');
+      const started = Date.now();
+      try {
+        now.mockReturnValue(started);
+        fetchMock.mockResolvedValueOnce(
+          new Response(null, { status: 429, headers: { 'retry-after': '60' } })
+        );
+        fetchMock.mockImplementation(async () => response());
+        const client = new QueryClient();
+        const tab = await show({ files: [testFile, other], pullRequest: request }, client);
+        await setInWindow(other.path);
+        await act(async () => {
+          await vi.waitFor(() =>
+            expect(client.getQueryState(blobKey(otherSha))?.status).toBe('error')
+          );
+        });
+        await setInWindow(greenhousePath);
+        await act(async () => {
+          await vi.waitFor(() => expect(client.getQueryState(blobKey(sha))?.status).toBe('error'));
+        });
+        expect(blobCalls()).toEqual([endpoint + otherSha]);
+        expect(tab.getByTestId(`partial:${greenhousePath}`)).toBeTruthy();
+        await setInWindow(greenhousePath, 'unmount');
+        now.mockReturnValue(started + 60_000);
+        await setInWindow(greenhousePath);
+        expect(await tab.findByTestId(`complete:${greenhousePath}`)).toBeTruthy();
+        expect(blobCalls()).toEqual([endpoint + otherSha, endpoint + sha]);
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it('keeps other prepared diffs when one blob arrives or a viewed mark changes', async () => {
+      localStorage.setItem(tokenKey, 'e2e-token');
+      let release!: (value: Response) => void;
+      const pending = new Promise<Response>((resolve) => {
+        release = resolve;
+      });
+      fetchMock.mockImplementation(async (url) =>
+        url === endpoint + otherSha ? pending : response()
+      );
+      const tab = await show({ files: [testFile, other], pullRequest: request });
+      await setInWindow(greenhousePath);
+      await tab.findByTestId(`complete:${greenhousePath}`);
+      const first = itemOf(greenhousePath)!.fileDiff;
+      await setInWindow(other.path);
+      await act(async () => release(response()));
+      await tab.findByTestId(`complete:${other.path}`);
+      expect(itemOf(greenhousePath)!.fileDiff).toBe(first);
+      const second = itemOf(other.path)!.fileDiff;
+      await click(viewedBox(tab, greenhousePath));
+      expect(itemOf(other.path)!.fileDiff).toBe(second);
+    });
+  });
+
   it('lists every file in the tree, patchless ones included', async () => {
     const tab = await show();
     const tree = tab.getByRole('list', { name: 'Files of mindroom-ai/mindroom-chat #200' });
