@@ -1,7 +1,7 @@
 // Ported from T3 Code (https://github.com/pingdotgg/t3code, apps/web/src/components/pullRequest/PullRequestChangeBreakdownStat.tsx at 8ab427c6), MIT, Copyright (c) 2026 T3 Tools Inc. See NOTICE.
 // The header's `+/-` stat, with a popover that splits the lines into code, tests, generated files
 // and docs. The files load on first focus or hover unless the Code tab already has them.
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { RectCords } from 'folds';
 import { usePluginTranslation } from '@mindroom/client-sdk/core';
 import { Menu, PopOut } from '@mindroom/client-sdk/ui';
@@ -42,10 +42,34 @@ export function ChangeBreakdownStat({
 }) {
   const t = usePluginTranslation('pull-requests');
   const tooltipId = useId();
+  const statRef = useRef<HTMLButtonElement>(null);
+  const wasOpenOnPress = useRef<boolean>();
   const [requested, setRequested] = useState(false);
   const [anchor, setAnchor] = useState<RectCords>();
   // Files the Code tab loaded already are in the cache, so a disabled query still has them.
   const query = usePullRequestFiles(pullRequestRef, requested);
+  const isOpen = !!anchor && !query.isError;
+  useEffect(() => {
+    const stat = statRef.current;
+    if (!isOpen || !stat) return undefined;
+    const doc = stat.ownerDocument;
+    // On iOS a tap need not focus the stat, so a tap elsewhere need not blur it either.
+    const onPointerDown = (event: PointerEvent) => {
+      if (!stat.contains(event.target as Node | null)) setAnchor(undefined);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      // Leave focus on the stat instead of letting the room shortcut move it to the composer.
+      if (doc.activeElement === stat) event.preventDefault();
+      setAnchor(undefined);
+    };
+    doc.addEventListener('pointerdown', onPointerDown, true);
+    doc.addEventListener('keydown', onKeyDown);
+    return () => {
+      doc.removeEventListener('pointerdown', onPointerDown, true);
+      doc.removeEventListener('keydown', onKeyDown);
+    };
+  }, [isOpen]);
   if (additions === 0 && deletions === 0) return null;
   const open = (element: HTMLElement) => {
     setRequested(true);
@@ -56,17 +80,28 @@ export function ChangeBreakdownStat({
   return (
     <>
       <button
+        ref={statRef}
         type="button"
         className="mrpr-stat-button"
         aria-label={label}
         aria-describedby={anchor && !query.isError ? tooltipId : undefined}
         onFocus={(event) => open(event.currentTarget)}
         onBlur={() => setAnchor(undefined)}
-        onPointerEnter={(event) => open(event.currentTarget)}
-        onPointerLeave={() => setAnchor(undefined)}
-        onClick={(event) => open(event.currentTarget)}
-        onKeyDown={(event) => {
-          if (event.key === 'Escape') setAnchor(undefined);
+        onPointerEnter={(event) => {
+          if (event.pointerType === 'mouse') open(event.currentTarget);
+        }}
+        onPointerLeave={(event) => {
+          if (event.pointerType === 'mouse') setAnchor(undefined);
+        }}
+        onPointerDown={() => {
+          // A pointer can focus the button before click. Toggle what was showing before the press.
+          wasOpenOnPress.current = isOpen;
+        }}
+        onClick={(event) => {
+          const wasOpen = event.detail ? wasOpenOnPress.current ?? isOpen : isOpen;
+          wasOpenOnPress.current = undefined;
+          if (wasOpen) setAnchor(undefined);
+          else open(event.currentTarget);
         }}
       >
         <PullRequestDiffStat additions={additions} deletions={deletions} />
