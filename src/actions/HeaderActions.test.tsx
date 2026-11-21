@@ -432,7 +432,7 @@ describe('HeaderActions', () => {
     };
     const view = await show(merged);
     await openMenu(view);
-    await click(row(view, 'Delete branch'));
+    await click(await view.findByRole('menuitem', { name: 'Delete branch' }));
     const dialog = view.getByRole('dialog', { name: 'Delete branch feature?' });
     expect(dialog.textContent).toContain(
       'This deletes feature from o/r on GitHub. Local branches and worktrees are not changed.'
@@ -443,7 +443,7 @@ describe('HeaderActions', () => {
     expect(writes()).toEqual([]);
 
     await openMenu(view);
-    await click(row(view, 'Delete branch'));
+    await click(await view.findByRole('menuitem', { name: 'Delete branch' }));
     const confirm = view
       .getByRole('dialog')
       .querySelector<HTMLButtonElement>('button:last-of-type')!;
@@ -489,7 +489,7 @@ describe('HeaderActions', () => {
   it('leaves a branch that got commits after the menu was drawn, and says so', async () => {
     const view = await show(merged);
     await openMenu(view);
-    await click(row(view, 'Delete branch'));
+    await click(await view.findByRole('menuitem', { name: 'Delete branch' }));
     headBranch = 'newer';
     await click(view.getByRole('dialog').querySelector<HTMLButtonElement>('button:last-of-type')!);
     await waitUntil(() =>
@@ -505,7 +505,7 @@ describe('HeaderActions', () => {
     stateNow = 'CLOSED';
     const view = await show({ ...open, state: 'closed', closedAt: '2026-11-15T00:00:00Z' });
     await openMenu(view);
-    await click(row(view, 'Delete branch'));
+    await click(await view.findByRole('menuitem', { name: 'Delete branch' }));
     stateNow = 'OPEN';
     await click(view.getByRole('dialog').querySelector<HTMLButtonElement>('button:last-of-type')!);
     await waitUntil(() =>

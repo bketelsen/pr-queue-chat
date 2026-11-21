@@ -42,7 +42,12 @@ export function PullRequestChip({
   const [element, setElement] = useState<HTMLElement | null>(null);
   // The Compact view draws every card of a room: a chip asks GitHub once it has been on screen.
   const queried = useOnScreenOnce(element) ? pullRequest : undefined;
-  const { pr, state, checks, error, checkList } = usePullRequestStatus(queried, CHIP_REFETCH);
+  // The hover card stands in for a title, which would show a second tooltip, a slow one.
+  const hoverCardOpen = useHoverCard(element);
+  const { pr, state, checks, error, checkList } = usePullRequestStatus(
+    queried,
+    hoverCardOpen ? NO_FOCUS_REFETCH : CHIP_REFETCH
+  );
   const mark = checks && pullRequestChecksStatePresentation(checks);
   // Until GitHub sent the pull request, or when it refused, the plain icon in the draft's tone.
   const StateIcon = state?.Icon ?? GitPullRequestArrow;
@@ -55,8 +60,6 @@ export function PullRequestChip({
     ? t('chip.label', { ...values, state: t(`state.${state.key}`) })
     : t('chip.labelWithoutState', values);
   const name = pr?.title ? `${label}\n${pr.title}` : label;
-  // The hover card stands in for a title, which would show a second tooltip, a slow one.
-  const hoverCardOpen = useHoverCard(element);
   const hoverCardId = useId();
   // The chip is drawn outside the card and the panel, so it sets the variables it draws with.
   return (

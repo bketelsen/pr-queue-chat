@@ -10,6 +10,7 @@ import { pullRequestKey, refreshPullRequest } from './queries';
 import { linkedRoom, type TestLink, type TestWorktree } from './testing/linkedRoom';
 import { githubServer } from './testing/mindroomServer';
 import { ThreadCardPullRequests } from './ThreadCardPullRequests';
+import { ThreadDetails } from './ThreadDetails';
 
 const ROOM_ID = '!room:example.org';
 // The thread `linkedRoom` links to unless told otherwise.
@@ -91,7 +92,11 @@ const showCardWave = async () => {
   }));
   const room = roomWith(links);
   const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
-  const wave = ({ omit, panel }: { omit?: number; panel?: number } = {}) => (
+  const wave = ({
+    omit,
+    panel,
+    details,
+  }: { omit?: number; panel?: number; details?: string } = {}) => (
     <QueryClientProvider client={client}>
       {links
         .filter(({ number }) => number !== omit)
@@ -99,15 +104,13 @@ const showCardWave = async () => {
           <ThreadCardPullRequests key={thread} room={room} threadId={thread} />
         ))}
       {panel && <PullRequestPanel roomId={ROOM_ID} request={sampleRef(panel)} />}
+      {details && <ThreadDetails room={room} threadId={details} />}
     </QueryClientProvider>
   );
-  const view = await renderPluginComponent(wave(), {
-    id: 'pull-requests',
-    plugin,
-    screenSize: 'Mobile',
-  });
+  const view = await renderPluginComponent(wave(), { id: 'pull-requests', plugin });
   return {
     client,
+    view,
     rerender: (options: Parameters<typeof wave>[0]) => view.rerender(wave(options)),
   };
 };
@@ -270,7 +273,8 @@ describe('ThreadCardPullRequests', () => {
     ).toHaveLength(requests.length);
   });
 
-  it('starts the panel summary and checks while twelve cold chips are still waiting', async () => {
+  const interactiveSurfaces = ['side panel', 'thread actions menu', 'chip hover card'] as const;
+  it.each(interactiveSurfaces)('does not queue %s reads', async (surface) => {
     const cards = held();
     const mindroom = githubServer(async (url) => {
       if (url.endsWith('/pulls/12')) {
@@ -284,10 +288,17 @@ describe('ThreadCardPullRequests', () => {
       return Response.json({}, { status: 404 });
     });
     roomServer.current = mindroom.server;
-    const { client, rerender } = await showCardWave();
+    const { client, rerender, view } = await showCardWave();
     try {
       await vi.waitFor(() => expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4]));
-      rerender({ panel: 12 });
+      if (surface === 'side panel') rerender({ panel: 12 });
+      else if (surface === 'thread actions menu') rerender({ details: '$sample12' });
+      else {
+        vi.stubGlobal('matchMedia', (query: string) => ({ matches: true, media: query }));
+        const chip = view.getByRole('img', { name: 'Pull request mindroom-ai/sample-repo #12' });
+        await act(async () => chip.dispatchEvent(new MouseEvent('mouseenter')));
+        await view.findByRole('tooltip');
+      }
       await vi.waitFor(() => {
         expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4, 12]);
         expect(
