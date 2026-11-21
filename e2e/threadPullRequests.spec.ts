@@ -983,59 +983,29 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
   expect(unanswered).toEqual([]);
 });
 
-for (const delay of [0, 800]) {
-  test(`phone lines tooltip stays open after a tap with a ${delay} ms files response`, async ({
-    browser,
-    baseURL,
-  }) => {
-    test.setTimeout(4 * 60_000);
-    const context = await browser.newContext({ baseURL, ...PHONE_CONTEXT });
-    const page = await context.newPage();
-    try {
-      const unanswered = await stubGitHub(page);
-      const pull = PULLS.sessionStore;
-      let requests = 0;
-      await page.route(
-        (url) => url.hostname === 'api.github.com' && url.pathname === `${pullPath(pull)}/files`,
-        async (route) => {
-          if (route.request().method() === 'OPTIONS') return route.fallback();
-          requests += 1;
-          if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-          await route.fulfill({
-            headers: CORS,
-            json: [
-              { filename: 'src/store.ts', status: 'modified', additions: 150, deletions: 30 },
-              { filename: 'src/store.test.ts', status: 'added', additions: 26, deletions: 0 },
-              { filename: 'README.md', status: 'modified', additions: 8, deletions: 7 },
-            ],
-          });
-        }
-      );
-      await openRoom(page);
-      await cardChips(page, roots.sessions).first().tap();
-      await expect(panel(page).locator('.mrpr-panel-title')).toHaveText(pull.title, {
-        timeout: 30_000,
-      });
-      const stat = panel(page).getByRole('button', { name: /^Lines changed/ });
-      const selector = '.mrpr-popover-fit';
-      const surface = page.locator(selector);
-      expect(requests).toBe(0);
-      await expect(surface).toHaveCount(0);
+const linesStat = (page: Page) => panel(page).getByRole('button', { name: /^Lines changed/ });
+// Both the old dialog and the tooltip render this surface, so the regression catches either
+// unmounting or moving out of the viewport without depending on the role being fixed.
+const linesSurface = '.mrpr-popover-fit';
 
-      for (const tap of [1, 2]) {
-        const sampler = await stat.evaluateHandle((button, selector) => {
-          // Start watching before the click's default focus. A single visibility assertion could
-          // land on one of the visible frames and miss the tooltip disappearing on the next one.
-          let until = performance.now() + 5_000;
-          button.addEventListener(
-            'pointerdown',
-            () => {
-              until = performance.now() + 1_500;
-            },
-            { once: true }
-          );
-          const frames = { visible: 0, missingAfterOpen: 0 };
-          const done = new Promise<typeof frames>((resolve) => {
+const openLinesPanel = async (page: Page, input: 'tap' | 'click') => {
+  await openRoom(page);
+  await cardChips(page, roots.sessions).first()[input]();
+  const title = panel(page).locator('.mrpr-panel-title');
+  await expect(title).toHaveText(PULLS.sessionStore.title, { timeout: 30_000 });
+  return title;
+};
+
+/** Samples the actual popup from contact, even if Playwright waits before making that contact. */
+const sampleLinesPress = (stat: Locator) =>
+  stat.evaluateHandle(
+    (button, selector) => ({
+      done: new Promise<{ visible: number; missingAfterOpen: number }>((resolve) => {
+        button.addEventListener(
+          'pointerdown',
+          () => {
+            const until = performance.now() + 1_500;
+            const frames = { visible: 0, missingAfterOpen: 0 };
             const sample = () => {
               const rect = document.querySelector(selector)?.getBoundingClientRect();
               if (
@@ -1055,26 +1025,125 @@ for (const delay of [0, 800]) {
               else resolve(frames);
             };
             requestAnimationFrame(sample);
-          });
-          return { done };
-        }, selector);
-        await stat.tap();
+          },
+          { once: true }
+        );
+      }),
+    }),
+    linesSurface
+  );
+
+const holdLinesStat = async (page: Page, stat: Locator) => {
+  await stat.tap({ trial: true });
+  const box = (await stat.boundingBox())!;
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ x: box.x + box.width / 2, y: box.y + box.height / 2 }],
+    });
+    // A short hold leaves enough time to see what pointerenter did before the finger lifts.
+    await page.waitForTimeout(100);
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally {
+    await cdp.detach();
+  }
+};
+
+test('lines tooltip closes on Escape without sending focus to the composer', async ({ page }) => {
+  test.setTimeout(4 * 60_000);
+  const unanswered = await stubGitHub(page);
+  await openLinesPanel(page, 'click');
+  const stat = linesStat(page);
+  const surface = page.locator(linesSurface);
+  await stat.focus();
+  await expect(surface).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(surface).toHaveCount(0);
+  await expect(stat).toBeFocused();
+
+  // A hover has no focus to lose; Escape still closes it.
+  await panel(page).getByRole('tab', { name: 'Summary' }).focus();
+  await stat.hover();
+  await expect(stat).not.toBeFocused();
+  await expect(surface).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(surface).toHaveCount(0);
+  expect(unanswered).toEqual([]);
+});
+
+test.describe('phone lines tooltip', () => {
+  test.use(PHONE_CONTEXT);
+
+  for (const press of ['tap', 'hold'] as const) {
+    for (const delay of [0, 800]) {
+      test(`stays open after a ${press} with a ${delay} ms files response`, async ({
+        page,
+        browserName,
+      }) => {
+        test.skip(
+          press === 'hold' && browserName !== 'chromium',
+          'A separated touch start and end use CDP'
+        );
+        test.setTimeout(4 * 60_000);
+        const unanswered = await stubGitHub(page);
+        const pull = PULLS.sessionStore;
+        let requests = 0;
+        await page.route(
+          (url) => url.hostname === 'api.github.com' && url.pathname === `${pullPath(pull)}/files`,
+          async (route) => {
+            if (route.request().method() === 'OPTIONS') return route.fallback();
+            requests += 1;
+            if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+            await route.fulfill({
+              headers: CORS,
+              json: [
+                { filename: 'src/store.ts', status: 'modified', additions: 150, deletions: 30 },
+                { filename: 'src/store.test.ts', status: 'added', additions: 26, deletions: 0 },
+                { filename: 'README.md', status: 'modified', additions: 8, deletions: 7 },
+              ],
+            });
+          }
+        );
+        await openLinesPanel(page, 'tap');
+        const stat = linesStat(page);
+        const surface = page.locator(linesSurface);
+        expect(requests).toBe(0);
+        await expect(surface).toHaveCount(0);
+        const sampler = await sampleLinesPress(stat);
+        if (press === 'hold') await holdLinesStat(page, stat);
+        else await stat.tap();
         const { visible, missingAfterOpen } = await sampler.evaluate(({ done }) => done);
         await sampler.dispose();
         expect(visible).toBeGreaterThan(1);
-        expect(missingAfterOpen, `frames missing after tap ${tap}`).toBe(0);
+        expect(missingAfterOpen, 'frames missing after opening').toBe(0);
         await expect(surface).toContainText('Total');
-      }
-      await shot(page, `phone-lines-${browser.browserType().name()}-${delay}`, {
-        keepPointer: true,
+        await shot(page, `after-${browserName}-${press}-${delay}`, { keepPointer: true });
+        expect(requests).toBe(1);
+        expect(unanswered).toEqual([]);
       });
-      expect(requests).toBe(1);
-      expect(unanswered).toEqual([]);
-    } finally {
-      await context.close();
     }
-  });
-}
+  }
+
+  for (const dismiss of ['tap outside', 'second tap'] as const) {
+    test(`closes on a ${dismiss}`, async ({ page, browserName }) => {
+      test.setTimeout(4 * 60_000);
+      const unanswered = await stubGitHub(page);
+      const title = await openLinesPanel(page, 'tap');
+      const stat = linesStat(page);
+      const surface = page.locator(linesSurface);
+      await stat.tap();
+      await expect(surface).toContainText('Total');
+      await (dismiss === 'tap outside' ? title : stat).tap();
+      await expect(surface).toHaveCount(0);
+      if (dismiss === 'tap outside') {
+        await expect(title).toBeVisible();
+        await shot(page, `after-${browserName}-tap-outside`, { keepPointer: true });
+      }
+      expect(unanswered).toEqual([]);
+    });
+  }
+});
 
 test('the Code tab highlights a hunk inside a docstring and can expand its context', async ({
   page,
