@@ -93,9 +93,9 @@ export function ChangeBreakdownStat({
         onPointerLeave={(event) => {
           if (event.pointerType === 'mouse') setAnchor(undefined);
         }}
-        onPointerDown={() => {
-          // A pointer can focus the button before click. Toggle what was showing before the press.
-          wasOpenOnPress.current = isOpen;
+        onPointerDown={(event) => {
+          // A mouse click keeps the hover tip open. Other pointers toggle the state before focus.
+          wasOpenOnPress.current = event.pointerType === 'mouse' ? false : isOpen;
         }}
         onClick={(event) => {
           const wasOpen = event.detail ? wasOpenOnPress.current ?? isOpen : isOpen;
