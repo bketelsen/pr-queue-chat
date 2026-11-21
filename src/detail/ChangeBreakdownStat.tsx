@@ -84,7 +84,7 @@ export function ChangeBreakdownStat({
         type="button"
         className="mrpr-stat-button"
         aria-label={label}
-        aria-describedby={anchor && !query.isError ? tooltipId : undefined}
+        aria-describedby={tooltipId}
         onFocus={(event) => open(event.currentTarget)}
         onBlur={() => setAnchor(undefined)}
         onPointerEnter={(event) => {
