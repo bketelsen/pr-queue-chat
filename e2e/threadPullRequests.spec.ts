@@ -949,6 +949,8 @@ test("the header's popovers hold still: the lines tooltip under the pointer, the
     ).toBe(true);
     await expect(tooltip).toHaveCount(1, { timeout: 0 });
   }
+  await stat.click();
+  await expect(tooltip).toBeVisible();
   await shot(page, 'lines-tooltip', { keepPointer: true });
   await page.mouse.move(0, 0);
   await expect(tooltip).toHaveCount(0);
