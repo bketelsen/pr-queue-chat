@@ -31,6 +31,7 @@ import {
 import { usePullRequestStatus } from './pullRequestStatus';
 import {
   answerOf,
+  BACKGROUND_READ,
   NO_FOCUS_REFETCH,
   unlessRefused,
   usePullRequests,
@@ -53,6 +54,8 @@ export const ANSWERED_ONLY = {
   retryOnMount: false,
   refetchOnReconnect: false,
 };
+
+const OVERVIEW_REFETCH = { ...ANSWERED_ONLY, ...BACKGROUND_READ };
 
 // How often the banner's button reads again a pull request that is still open or a draft.
 const UNSETTLED_INTERVAL = 5 * 60_000;
@@ -151,7 +154,7 @@ export function Details({
   inBanner?: boolean;
 }) {
   const bannerRefetch = useBannerRefetch(false);
-  const refetch = inBanner ? bannerRefetch : ANSWERED_ONLY;
+  const refetch = inBanner ? bannerRefetch : OVERVIEW_REFETCH;
   // The same queries as each pull request's below, so they ask GitHub nothing more.
   const queries = usePullRequests(pullRequests, refetch);
   const heads = queries.map((query) => (inBanner ? answerOf(query) : query.data)?.headRef);

@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { onlineManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { Room } from 'matrix-js-sdk';
 import { act } from 'react-dom/test-utils';
 import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import plugin from './index';
+import PullRequestPanel from './PullRequestPanel';
+import { pullRequestKey, refreshPullRequest } from './queries';
 import { linkedRoom, type TestLink, type TestWorktree } from './testing/linkedRoom';
 import { githubServer } from './testing/mindroomServer';
 import { ThreadCardPullRequests } from './ThreadCardPullRequests';
@@ -71,6 +73,53 @@ const show = async (
 
 const chips = (view: Awaited<ReturnType<typeof show>>) =>
   view.getAllByRole('img', { name: /^Pull request / });
+
+const sampleRef = (number: number) => ({ owner: 'mindroom-ai', repo: 'sample-repo', number });
+
+const held = () => {
+  let release = () => {};
+  const reply = new Promise<void>((resolve) => (release = resolve));
+  return { reply, release };
+};
+
+const showCardWave = async () => {
+  vi.stubGlobal('IntersectionObserver', undefined);
+  const links = Array.from({ length: 12 }, (_, i) => ({
+    thread: `$sample${i + 1}`,
+    repo: 'sample-repo',
+    number: i + 1,
+  }));
+  const room = roomWith(links);
+  const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
+  const wave = ({ omit, panel }: { omit?: number; panel?: number } = {}) => (
+    <QueryClientProvider client={client}>
+      {links
+        .filter(({ number }) => number !== omit)
+        .map(({ thread }) => (
+          <ThreadCardPullRequests key={thread} room={room} threadId={thread} />
+        ))}
+      {panel && <PullRequestPanel roomId={ROOM_ID} request={sampleRef(panel)} />}
+    </QueryClientProvider>
+  );
+  const view = await renderPluginComponent(wave(), {
+    id: 'pull-requests',
+    plugin,
+    screenSize: 'Mobile',
+  });
+  return {
+    client,
+    rerender: (options: Parameters<typeof wave>[0]) => view.rerender(wave(options)),
+  };
+};
+
+const summaryNumbers = (urls: readonly string[]) =>
+  urls.flatMap((url) => {
+    const match = /\/pulls\/(\d+)$/.exec(url);
+    return match ? [Number(match[1])] : [];
+  });
+
+const proxiedSummaries = (mindroom: ReturnType<typeof githubServer>) =>
+  summaryNumbers(mindroom.githubRequests().map(({ path }) => path));
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -219,6 +268,132 @@ describe('ThreadCardPullRequests', () => {
         ([path, init]) => path === '/api/github/request' && init?.method === 'POST'
       )
     ).toHaveLength(requests.length);
+  });
+
+  it('starts the panel summary and checks while twelve cold chips are still waiting', async () => {
+    const cards = held();
+    const mindroom = githubServer(async (url) => {
+      if (url.endsWith('/pulls/12')) {
+        return Response.json({ title: 'Sample change', state: 'open', head: { sha: 'abc12' } });
+      }
+      if (summaryNumbers([url]).length) {
+        await cards.reply;
+        return Response.json({ state: 'closed' });
+      }
+      if (url.includes('/commits/abc12/')) return Response.json({});
+      return Response.json({}, { status: 404 });
+    });
+    roomServer.current = mindroom.server;
+    const { client, rerender } = await showCardWave();
+    try {
+      await vi.waitFor(() => expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4]));
+      rerender({ panel: 12 });
+      await vi.waitFor(() => {
+        expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4, 12]);
+        expect(
+          mindroom.githubRequests().filter(({ path }) => path.includes('/commits/abc12/'))
+        ).toHaveLength(2);
+      });
+    } finally {
+      cards.release();
+    }
+    await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+    expect(proxiedSummaries(mindroom).filter((number) => number === 12)).toEqual([12]);
+  });
+
+  it.each([false, true])(
+    'prioritizes a post-write refresh without a panel (offline: %s)',
+    async (offline) => {
+      const cards = held();
+      const mindroom = githubServer(async (url) => {
+        if (!url.endsWith('/pulls/12')) await cards.reply;
+        return Response.json({ state: 'closed' });
+      });
+      roomServer.current = mindroom.server;
+      const { client } = await showCardWave();
+      const ref = sampleRef(12);
+      const access = `server:${mindroom.server.origin}:octo:0`;
+      const cacheKey = [...pullRequestKey(ref), access];
+      try {
+        await vi.waitFor(() => expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4]));
+        if (offline) {
+          // With a cached answer, post-write invalidation replaces the waiting read with a fresh one.
+          client.setQueryData(cacheKey, { state: 'open' });
+          onlineManager.setOnline(false);
+        }
+        const refresh = refreshPullRequest(client, ref, access);
+        if (offline) {
+          await refresh;
+          expect(client.getQueryState(cacheKey)?.fetchStatus).toBe('paused');
+          onlineManager.setOnline(true);
+        }
+        await vi.waitFor(() => {
+          expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4, 12]);
+          expect(client.getQueryData(cacheKey)).toMatchObject({ state: 'closed' });
+        });
+        await expect(refresh).resolves.toBe(true);
+      } finally {
+        onlineManager.setOnline(true);
+        cards.release();
+      }
+      await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+    }
+  );
+
+  it.each([
+    { name: 'skips an unmounted queued chip and keeps draining', omit: 5, status: 200, next: 6 },
+    { name: 'frees the slot when a read fails', omit: undefined, status: 500, next: 5 },
+  ])('$name', async ({ omit, status, next }) => {
+    const first = held();
+    const rest = held();
+    const mindroom = githubServer(async (url) => {
+      const isFirst = url.endsWith('/pulls/1');
+      await (isFirst ? first.reply : rest.reply);
+      return Response.json({ state: 'closed' }, { status: isFirst ? status : 200 });
+    });
+    roomServer.current = mindroom.server;
+    const { client, rerender } = await showCardWave();
+    try {
+      await vi.waitFor(() => expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4]));
+      if (omit) rerender({ omit });
+      first.release();
+      await vi.waitFor(() => expect(proxiedSummaries(mindroom)).toEqual([1, 2, 3, 4, next]));
+    } finally {
+      first.release();
+      rest.release();
+    }
+    await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+    const requested = proxiedSummaries(mindroom);
+    if (omit) expect(requested).not.toContain(omit);
+    expect(requested).toContain(12);
+  });
+
+  it('does not cap chip reads made directly with a browser token', async () => {
+    localStorage.setItem(
+      'mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/githubToken',
+      'ghp_test'
+    );
+    const cards = held();
+    fetchMock.mockImplementation(async () => {
+      await cards.reply;
+      return Response.json({ state: 'closed' });
+    });
+    const { client } = await showCardWave();
+    try {
+      await vi.waitFor(() => {
+        const urls = fetchMock.mock.calls.map(([url]) => url);
+        expect(summaryNumbers(urls)).toHaveLength(12);
+        expect(urls.every((url) => url.startsWith('https://api.github.com/'))).toBe(true);
+        expect(
+          fetchMock.mock.calls.every(
+            ([, init]) => new Headers(init?.headers).get('Authorization') === 'Bearer ghp_test'
+          )
+        ).toBe(true);
+      });
+    } finally {
+      cards.release();
+    }
+    await vi.waitFor(() => expect(client.isFetching()).toBe(0));
   });
 
   it('shows two chips and the count of the rest', async () => {

@@ -8,7 +8,10 @@ import type { PullRequestRef } from './github';
 import { PullRequestHoverCard, useHoverCard } from './PullRequestHoverCard';
 import { pullRequestChecksStatePresentation } from './presentation';
 import { usePullRequestStatus } from './pullRequestStatus';
+import { BACKGROUND_READ, NO_FOCUS_REFETCH } from './queries';
 import { pluginRootStyle } from './theme';
+
+const CHIP_REFETCH = { ...NO_FOCUS_REFETCH, ...BACKGROUND_READ };
 
 /** Whether `element` has been on screen; at once where the browser cannot tell. */
 function useOnScreenOnce(element: Element | null): boolean {
@@ -39,7 +42,7 @@ export function PullRequestChip({
   const [element, setElement] = useState<HTMLElement | null>(null);
   // The Compact view draws every card of a room: a chip asks GitHub once it has been on screen.
   const queried = useOnScreenOnce(element) ? pullRequest : undefined;
-  const { pr, state, checks, error, checkList } = usePullRequestStatus(queried);
+  const { pr, state, checks, error, checkList } = usePullRequestStatus(queried, CHIP_REFETCH);
   const mark = checks && pullRequestChecksStatePresentation(checks);
   // Until GitHub sent the pull request, or when it refused, the plain icon in the draft's tone.
   const StateIcon = state?.Icon ?? GitPullRequestArrow;
