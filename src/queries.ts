@@ -140,7 +140,7 @@ export const BACKGROUND_READ = { meta: { mindroomPullRequestsBackground: true } 
  * already there. */
 export type RefetchOptions = {
   meta?: typeof BACKGROUND_READ.meta;
-  enabled?: false;
+  enabled?: false | ((query: QueryState) => boolean);
   refetchOnWindowFocus?: boolean | ((query: QueryState) => boolean);
   refetchOnMount?: boolean | ((query: QueryState) => boolean);
   refetchOnReconnect?: boolean | ((query: QueryState) => boolean);
@@ -175,11 +175,23 @@ function watchProxyReads(cache: QueryCache) {
   if (watchedProxyCaches.has(cache)) return;
   watchedProxyCaches.add(cache);
   cache.subscribe(({ type, query }) => {
-    if (type !== 'observerAdded' && type !== 'observerOptionsUpdated') return;
+    if (
+      type !== 'observerAdded' &&
+      type !== 'observerRemoved' &&
+      type !== 'observerOptionsUpdated'
+    ) {
+      return;
+    }
     const start = waitingProxyReads.get(query);
-    if (start && observerPriority(query) === 'foreground') start(false);
+    if (!start) return;
+    const priority = observerPriority(query);
+    if (priority === 'foreground') start(false);
+    else if (priority === undefined) void query.cancel({ revert: true });
   });
 }
+
+const enabledOf = (base: boolean, extra: RefetchOptions['enabled']) =>
+  !base || extra === false ? false : extra ?? true;
 
 async function withProxyRead<T>(
   { client, queryKey, signal, meta }: QueryFunctionContext,
@@ -248,10 +260,10 @@ const pullRequestQuery = (
     };
     return access.via === 'server' ? withProxyRead(context, read) : read();
   },
-  enabled: ref !== undefined && !access.pending,
   staleTime: STALE_TIME,
   retry,
   ...options,
+  enabled: enabledOf(ref !== undefined && !access.pending, options.enabled),
 });
 
 export function usePullRequest(ref: PullRequestRef | undefined, options: RefetchOptions = {}) {
@@ -389,10 +401,10 @@ function useRefQuery<T>(
       const read = () => load(ref as PullRequestRef, access.authFor(access.key), signal);
       return limitProxyReads && access.via === 'server' ? withProxyRead(context, read) : read();
     },
-    enabled: enabled && ref !== undefined && !access.pending,
     staleTime: STALE_TIME,
     retry,
     ...options,
+    enabled: enabledOf(enabled && ref !== undefined && !access.pending, options.enabled),
   });
 }
 

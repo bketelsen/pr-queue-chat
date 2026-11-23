@@ -695,6 +695,95 @@ describe('ThreadCardPullRequests', () => {
     expect(proxiedSummaries(mindroom)).toEqual([1, 2]);
   });
 
+  it('shows the cached open pull request and checks on remount before being seen', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    const mindroom = githubServer(async (url) => {
+      if (url.endsWith('/pulls/2'))
+        return Response.json({ state: 'open', head: { sha: 'abc123' } });
+      if (url.includes('/pulls/')) {
+        return Response.json({ state: 'closed', merged_at: '2026-11-18T10:00:00Z' });
+      }
+      if (url.includes('/check-runs?')) {
+        return Response.json({
+          check_runs: [{ name: 'Build', status: 'completed', conclusion: 'success' }],
+        });
+      }
+      return Response.json({ statuses: [] });
+    });
+    roomServer.current = mindroom.server;
+    const client = new QueryClient();
+    const room = roomWith([1, 2].map(sampleRef));
+    const first = await show(room, { phone: true, client });
+    await act(async () => report(true));
+    await first.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #2: Open' });
+    await act(async () => report(true));
+    await vi.waitFor(() => {
+      expect(first.container.querySelector('.mrpr-chip-checks')?.getAttribute('class')).toContain(
+        'mrpr-tone-success'
+      );
+      expect(client.isFetching()).toBe(0);
+    });
+    first.unmount();
+    await client.invalidateQueries({ queryKey: ['pull-requests'], refetchType: 'none' });
+    observers.length = 0;
+    const asked = mindroom.githubRequests().length;
+    const remount = await show(room, { phone: true, client });
+    const chip = remount.getByRole('img', {
+      name: 'Pull request mindroom-ai/sample-repo #2: Open',
+    });
+    expect(chips(remount).map((entry) => entry.textContent)).toEqual(['#2']);
+    expect(chip.firstElementChild?.getAttribute('class')).toContain('mrpr-tone-open');
+    expect(remount.container.querySelector('.mrpr-chip-checks')?.getAttribute('class')).toContain(
+      'mrpr-tone-success'
+    );
+    expect(mindroom.githubRequests()).toHaveLength(asked);
+    // Adding an uncached pull request before being seen keeps the settled rank without fetching.
+    remount.rerenderRoom(roomWith([1, 2, 3].map(sampleRef)));
+    expect(chips(remount).map((entry) => entry.textContent)).toEqual(['#2']);
+    expect(mindroom.githubRequests()).toHaveLength(asked);
+    await act(async () => report(true));
+    await vi.waitFor(() => {
+      expect(proxiedSummaries(mindroom)).toContain(3);
+      expect(client.isFetching()).toBe(0);
+    });
+  });
+
+  it('waits on partial cache and keeps anonymous link order before being seen', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    const mindroom = githubServer(async () =>
+      Response.json({ state: 'closed', merged_at: '2026-11-18T10:00:00Z' })
+    );
+    roomServer.current = mindroom.server;
+    const client = new QueryClient();
+    client.setQueryData(['pull-requests-github-status', mindroom.server.origin], {
+      connected: true,
+      login: 'octo',
+      via: 'app',
+    });
+    client.setQueryData(
+      [...pullRequestKey(sampleRef(2)), `server:${mindroom.server.origin}:octo:0`],
+      { state: 'open' }
+    );
+    const partial = await show(roomWith([1, 2].map(sampleRef)), { phone: true, client });
+    expect(chips(partial).map((entry) => entry.textContent)).toEqual(['#1']);
+    expect(proxiedSummaries(mindroom)).toEqual([]);
+    await act(async () => report(true));
+    await partial.findByRole('img', { name: 'Pull request mindroom-ai/sample-repo #2: Open' });
+    partial.unmount();
+    roomServer.current = undefined;
+    observers.length = 0;
+    fetchMock.mockClear();
+    const anonClient = new QueryClient();
+    anonClient.setQueryData([...pullRequestKey(sampleRef(1)), false], { state: 'merged' });
+    anonClient.setQueryData([...pullRequestKey(sampleRef(2)), false], { state: 'open' });
+    const anon = await show(roomWith([1, 2].map(sampleRef)), { phone: true, client: anonClient });
+    expect(chips(anon).map((entry) => entry.textContent)).toEqual(['#1']);
+    expect(
+      anon.getByRole('img', { name: 'Pull request mindroom-ai/sample-repo #1: Merged' })
+    ).toBeDefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it.each([
     { status: 404, priorAnswer: false },
     { status: 404, priorAnswer: true },
@@ -733,6 +822,32 @@ describe('ThreadCardPullRequests', () => {
       expect(hiddenReads()).toBe(expected);
     }
   );
+
+  it('does not refetch a refused hidden summary when becoming seen on remount', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    let failing = true;
+    const mindroom = githubServer(async (url) =>
+      url.endsWith('/pulls/2') && failing
+        ? Response.json({}, { status: 404 })
+        : Response.json({ state: 'open' })
+    );
+    roomServer.current = mindroom.server;
+    const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
+    const key = [...pullRequestKey(sampleRef(2)), `server:${mindroom.server.origin}:octo:0`];
+    const room = roomWith([1, 2].map(sampleRef));
+    const first = await show(room, { phone: true, client });
+    await act(async () => report(true));
+    await vi.waitFor(() => expect(client.getQueryState(key)?.status).toBe('error'));
+    const hiddenReads = () => proxiedSummaries(mindroom).filter((number) => number === 2).length;
+    const before = hiddenReads();
+    first.unmount();
+    failing = false;
+    observers.length = 0;
+    await show(room, { phone: true, client });
+    await act(async () => report(true));
+    await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+    expect(hiddenReads()).toBe(before);
+  });
 
   it('keeps anonymous link order and reads only the shown pull requests', async () => {
     const client = new QueryClient();

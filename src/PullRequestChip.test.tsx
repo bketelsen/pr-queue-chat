@@ -60,11 +60,11 @@ const serve = (pr: unknown, runs: unknown[] = [], reviews: unknown[] = []) =>
 
 const show = async (
   props: Partial<ComponentProps<typeof PullRequestChip>> = {},
-  server?: MindroomServer
-) => {
-  const client = new QueryClient({
+  server?: MindroomServer,
+  client = new QueryClient({
     defaultOptions: { queries: { retry: false, retryDelay: 0 } },
-  });
+  })
+) => {
   const view = await renderPluginComponent(
     <QueryClientProvider client={client}>
       <GitHubServerContext.Provider value={{ server, pending: false }}>
@@ -240,6 +240,45 @@ describe('PullRequestChip', () => {
     report(true);
     await view.findByRole('img', { name: /: Closed/ });
     expect(requested('/pulls/412')).toBe(true);
+  });
+
+  it('shows cached state and checks on remount before being seen, without fetching', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver);
+    saveToken();
+    const widget = { owner: 'acme', repo: 'widget', number: 7 };
+    fetchMock.mockImplementation(async (url) => {
+      if (url.endsWith('/repos/acme/widget/pulls/7'))
+        return respond(pull({ title: 'Ship widget' }));
+      if (url.includes(`/commits/${SHA}/check-runs?`))
+        return respond({ check_runs: [run('success')] });
+      if (url.includes(`/commits/${SHA}/status?`)) return respond({ statuses: [] });
+      return respond({ message: 'Not Found' }, 404);
+    });
+    const first = await show({ pullRequest: widget });
+    expect(fetchMock).not.toHaveBeenCalled();
+    report(true);
+    await vi.waitFor(() =>
+      expect(
+        first.view.container.querySelector('.mrpr-chip-checks')?.getAttribute('class')
+      ).toContain('mrpr-tone-success')
+    );
+    await answered(first.client, '/check-runs');
+    first.view.unmount();
+    await first.client.invalidateQueries({ queryKey: ['pull-requests'], refetchType: 'none' });
+    fetchMock.mockClear();
+    observers.length = 0;
+    const remount = await show({ pullRequest: widget }, undefined, first.client);
+    const chip = remount.view.getByRole('img', {
+      name: 'Pull request acme/widget #7: Open\nShip widget',
+    });
+    expect(chip.firstElementChild?.getAttribute('class')).toContain('mrpr-tone-open');
+    expect(
+      remount.view.container.querySelector('.mrpr-chip-checks')?.getAttribute('class')
+    ).toContain('mrpr-tone-success');
+    expect(fetchMock).not.toHaveBeenCalled();
+    report(true);
+    await answered(remount.client, '/check-runs');
+    expect(requested('/pulls/7')).toBe(true);
   });
 
   it.each([
