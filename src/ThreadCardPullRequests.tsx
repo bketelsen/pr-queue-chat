@@ -64,8 +64,9 @@ function CardChips({
   const seen = useOnScreenOnce(element);
   const { via, pending } = useGitHubAccess();
   const reading = seen && via !== undefined;
-  const queries = usePullRequests(reading ? pullRequests : [], {
+  const queries = usePullRequests(pullRequests, {
     ...CHIP_REFETCH,
+    enabled: reading ? unlessRefused : false,
     refetchOnMount: unlessRefused,
     retryOnMount: unlessRefused,
     refetchOnReconnect: unlessRefused,
@@ -74,7 +75,7 @@ function CardChips({
   const previous = settledRanks.current;
   const idle = queries.every((query) => query.fetchStatus === 'idle');
   const answered = queries.every((query) => !query.isPending);
-  const settled = reading && !pending && (previous ? idle : answered);
+  const settled = via !== undefined && !pending && answered && (!previous || idle);
   let ordered = pullRequests;
   if (settled) {
     ordered = orderPullRequests(pullRequests, queries.map(answerOf));
