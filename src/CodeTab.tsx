@@ -7,7 +7,12 @@
 // a viewed mark; the toolbar counts the viewed files and holds the display controls.
 import { usePluginTranslation } from '@mindroom/client-sdk/core';
 import { IconButton, IconTooltip, useThemeKind } from '@mindroom/client-sdk/ui';
-import type { CodeViewDiffItem, CodeViewItem, PostRenderPhase } from '@pierre/diffs';
+import type {
+  CodeViewDiffItem,
+  CodeViewItem,
+  FileDiffLoadedFiles,
+  FileDiffMetadata,
+} from '@pierre/diffs';
 import type { CodeViewAnnotationArgs, CodeViewHandle } from '@pierre/diffs/react';
 import type { GitStatus } from '@pierre/trees';
 import {
@@ -57,6 +62,7 @@ import {
   fnv1a32,
   getRenderablePatch,
   prepareFileDiff,
+  reconstructOldFile,
   resolveFileDiffPath,
 } from './diff/diffRendering';
 import { orderDiffFiles } from './diff/fileOrder.logic';
@@ -72,9 +78,10 @@ import {
 } from './github';
 import { GitHubErrorState } from './GitHubErrorState';
 import { PullRequestDiffStat, PullRequestMetaLine } from './presentation';
-import { useCommitFiles, useDiffBlobs } from './queries';
+import { loadDiffBlob, useCommitFiles } from './queries';
 import type { ReviewThread } from './reviewThreads';
 import { pluginRootStyle } from './theme';
+import { useGitHubAccess } from './token';
 
 /** A list the panel loads for the tab: its items once they have loaded, else why they did not. */
 export type ListState<T> =
@@ -320,26 +327,8 @@ export function CodeTab({
     refocusFiles.current = false;
     if (!treeOpen) filesButtonRef.current?.focus({ preventScroll: true });
   }, [treeOpen]);
-  const [nearViewport, setNearViewport] = useState<ReadonlySet<string>>(() => new Set());
-  // Pierre only mounts items in its virtualized window (visible rows plus overscan).
-  const onDiffRender = useCallback(
-    (
-      _node: HTMLElement,
-      _instance: unknown,
-      phase: PostRenderPhase,
-      { item }: { item: { id: string } }
-    ) => {
-      if (phase === 'update') return;
-      setNearViewport((previous) => {
-        if (previous.has(item.id) === (phase === 'mount')) return previous;
-        const next = new Set(previous);
-        if (phase === 'mount') next.add(item.id);
-        else next.delete(item.id);
-        return next;
-      });
-    },
-    []
-  );
+  const access = useGitHubAccess();
+  const canLoadDiffFiles = access.via !== undefined && !access.pending;
   const viewerRef = useRef<CodeViewHandle<ThreadGroup, undefined>>(null);
   const rowsRef = useRef(new Map<string, HTMLElement>());
 
@@ -393,8 +382,11 @@ export function CodeTab({
     [foldKeyOf, folds.override, folds.choices, isViewedNow]
   );
 
-  // The highlighted lines depend on the theme, so the parse cache key carries it.
-  const scope = `pull-request:${pullRequest.owner}/${pullRequest.repo}#${pullRequest.number}:${themeKind}`;
+  // Scope cache keys to PR, commit view, credentials, and theme so Pierre never reuses a diff
+  // mutated in place by `loadDiffFiles` across views or accounts.
+  const scope = `pull-request:${pullRequest.owner}/${pullRequest.repo}#${
+    pullRequest.number
+  }:${view}:${String(access.key)}:${themeKind}`;
   const { ignoreWhitespace, hideTests } = prefs;
   const parsedFiles = useMemo(() => {
     const patch = (viewFiles ?? [])
@@ -406,52 +398,137 @@ export function CodeTab({
     return parsed?.kind === 'files' ? orderDiffFilesLikeTree(orderDiffFiles(parsed.files)) : [];
   }, [viewFiles, scope]);
 
+  const parsedByPath = useMemo(
+    () => new Map(parsedFiles.map((file) => [resolveFileDiffPath(file), file])),
+    [parsedFiles]
+  );
   const testPaths = useMemo(
     () => new Set((viewFiles ?? []).map((file) => file.path).filter(isTestFile)),
     [viewFiles]
-  );
-  const shownPartialDiffs = useMemo(
-    () =>
-      hideTests
-        ? parsedFiles.filter((fileDiff) => !testPaths.has(resolveFileDiffPath(fileDiff)))
-        : parsedFiles,
-    [parsedFiles, hideTests, testPaths]
   );
   const sourceByPath = useMemo(
     () => new Map(viewFiles?.map((file) => [file.path, file])),
     [viewFiles]
   );
-  const targets = useMemo(
+  // Prepare before filtering tests so toggling `hideTests` keeps the same `fileDiff` identity for
+  // unchanged source files (including folded ones whose instance Pierre retains).
+  const preparedFiles = useMemo(
     () =>
-      shownPartialDiffs.filter(canHydrateDiff).flatMap((diff) => {
-        const path = resolveFileDiffPath(diff);
-        const sha = sourceByPath.get(path)?.sha;
-        return sha ? [{ path, sha }] : [];
-      }),
-    [shownPartialDiffs, sourceByPath]
-  );
-  const shas = useMemo(() => [...new Set(targets.map(({ sha }) => sha))], [targets]);
-  const enabledShas = useMemo(
-    () =>
-      new Set(
-        targets.flatMap(({ path, sha }) =>
-          nearViewport.has(path) && !collapsedOf(path) ? [sha] : []
-        )
+      parsedFiles.map((parsed) =>
+        prepareFileDiff(parsed, {
+          ignoreWhitespace,
+          sha: sourceByPath.get(resolveFileDiffPath(parsed))?.sha,
+        })
       ),
-    [targets, nearViewport, collapsedOf]
+    [parsedFiles, sourceByPath, ignoreWhitespace]
   );
-  const blobs = useDiffBlobs(pullRequest, shas, enabledShas);
+  const cacheKeyByPath = useMemo(
+    () => new Map(preparedFiles.map((file) => [resolveFileDiffPath(file), file.cacheKey])),
+    [preparedFiles]
+  );
   const shownDiffs = useMemo(
     () =>
-      shownPartialDiffs.map((file) => {
-        const source = sourceByPath.get(resolveFileDiffPath(file));
-        return prepareFileDiff(file, {
-          source,
-          blob: source?.sha ? blobs.get(source.sha) : undefined,
-          ignoreWhitespace,
+      hideTests
+        ? preparedFiles.filter((fileDiff) => !testPaths.has(resolveFileDiffPath(fileDiff)))
+        : preparedFiles,
+    [preparedFiles, hideTests, testPaths]
+  );
+
+  const [expandNotice, setExpandNotice] = useState<{ scope: string; path: string } | null>(null);
+  const expandFailurePath = expandNotice?.scope === scope ? expandNotice.path : null;
+
+  // Abort in-flight blob reads on unmount or when the diff view, credentials, theme, or
+  // whitespace mode changes — not on unrelated file-list refreshes that retain existing items.
+  const sessionRef = useRef<{
+    scope: string;
+    controller: AbortController;
+    inFlight: Map<string, Promise<string | null>>;
+    unavailableShas: Set<string>;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const controller = new AbortController();
+    const session = {
+      scope,
+      controller,
+      inFlight: new Map<string, Promise<string | null>>(),
+      unavailableShas: new Set<string>(),
+    };
+    sessionRef.current = session;
+    return () => {
+      controller.abort();
+      if (sessionRef.current === session) sessionRef.current = null;
+    };
+  }, [scope, ignoreWhitespace]);
+
+  const loaderRef = useRef({ pullRequest, access, sourceByPath, parsedByPath, cacheKeyByPath });
+  useLayoutEffect(() => {
+    loaderRef.current = { pullRequest, access, sourceByPath, parsedByPath, cacheKeyByPath };
+  });
+  const loadDiffFiles = useCallback(
+    async (fileDiff: FileDiffMetadata): Promise<FileDiffLoadedFiles> => {
+      const session = sessionRef.current;
+      const signal = session?.controller.signal;
+      if (!session || !signal || signal.aborted) throw new Error('Diff expansion cancelled');
+      const {
+        pullRequest: ref,
+        access: currentAccess,
+        sourceByPath: sources,
+        parsedByPath: parsedFilesByPath,
+        cacheKeyByPath: cacheKeys,
+      } = loaderRef.current;
+      const path = resolveFileDiffPath(fileDiff);
+      const parsed = parsedFilesByPath.get(path);
+      const source = sources.get(path);
+      const expectedKey = cacheKeys.get(path);
+      if (expectedKey === undefined || fileDiff.cacheKey !== expectedKey) {
+        throw new Error('Diff expansion cancelled');
+      }
+      const fail = (error: unknown) => {
+        if (!signal.aborted && path && loaderRef.current.cacheKeyByPath.get(path) === expectedKey) {
+          setExpandNotice({ scope: session.scope, path });
+        }
+        return error;
+      };
+      if (
+        !parsed ||
+        !canHydrateDiff(parsed) ||
+        !source?.sha ||
+        currentAccess.via === undefined ||
+        currentAccess.pending
+      ) {
+        throw fail(new Error('Diff cannot be expanded'));
+      }
+      const { sha } = source;
+      if (session.unavailableShas.has(sha)) throw fail(new Error('Diff blob unavailable'));
+      const pending =
+        session.inFlight.get(sha) ??
+        loadDiffBlob(ref, sha, currentAccess, signal).finally(() => {
+          session.inFlight.delete(sha);
         });
-      }),
-    [shownPartialDiffs, sourceByPath, blobs, ignoreWhitespace]
+      session.inFlight.set(sha, pending);
+      let blob: string | null;
+      try {
+        blob = await pending;
+      } catch (error) {
+        throw fail(error);
+      }
+      signal.throwIfAborted();
+      if (loaderRef.current.cacheKeyByPath.get(path) !== expectedKey) {
+        throw new Error('Diff expansion cancelled');
+      }
+      if (blob === null) {
+        session.unavailableShas.add(sha);
+        throw fail(new Error('Diff blob unavailable'));
+      }
+      const old = reconstructOldFile(parsed, source, blob);
+      if (old === null) throw fail(new Error('Diff blob mismatch'));
+      setExpandNotice(null);
+      return {
+        oldFile: { name: parsed.prevName ?? parsed.name, contents: old },
+        newFile: { name: parsed.name, contents: blob },
+      };
+    },
+    []
   );
   const hiddenTests = hideTests ? testPaths.size : 0;
   // A file without a diff to show, as GitHub sends none for a binary or a very large file.
@@ -767,7 +844,8 @@ export function CodeTab({
       {commits.status === 'error' ||
       threads.status === 'error' ||
       truncatedReviewComments !== undefined ||
-      truncatedCommits !== undefined ? (
+      truncatedCommits !== undefined ||
+      expandFailurePath !== null ? (
         <div className="mrpr-code-notices">
           {commits.status === 'error' ? (
             <GitHubErrorState compact error={commits.error} onRetry={commits.retry} />
@@ -786,6 +864,11 @@ export function CodeTab({
               label={t('truncated.commits', { count: truncatedCommits })}
               href={`${pullRequestUrl(pullRequest)}/commits`}
             />
+          ) : null}
+          {expandFailurePath !== null ? (
+            <p role="status" className="mrpr-status mrpr-note">
+              {t('code.contextUnavailable', { path: expandFailurePath })}
+            </p>
           ) : null}
         </div>
       ) : null}
@@ -819,7 +902,7 @@ export function CodeTab({
                   overflow: prefs.wrap ? 'wrap' : 'scroll',
                   lineDiffType: 'none',
                   stickyHeaders: true,
-                  onPostRender: onDiffRender,
+                  loadDiffFiles: canLoadDiffFiles ? loadDiffFiles : undefined,
                 }}
                 renderCodeViewFooter={renderWithoutDiff}
                 renderHeaderPrefix={renderHeaderPrefix}

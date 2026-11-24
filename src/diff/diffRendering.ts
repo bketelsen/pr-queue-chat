@@ -1,12 +1,7 @@
 // Ported from T3 Code (https://github.com/pingdotgg/t3code, apps/web/src/lib/diffRendering.ts at 8ab427c6), MIT, Copyright (c) 2026 T3 Tools Inc. See NOTICE.
 // Patch parsing, whitespace hiding and the diff surface's theme, the part of T3 Code's diff
 // rendering the Code tab uses.
-import {
-  hydratePartialDiff,
-  parseDiffFromFile,
-  parsePatchFiles,
-  type FileDiffMetadata,
-} from '@pierre/diffs';
+import { parseDiffFromFile, parsePatchFiles, type FileDiffMetadata } from '@pierre/diffs';
 import { GIT_LFS_POINTER_HEADER, MAX_DIFF_BLOB_BYTES, type DiffSource } from './diffSource';
 
 export const DIFF_THEME_NAMES = {
@@ -193,46 +188,20 @@ export function reconstructOldFile(
   return new TextEncoder().encode(contents).length <= MAX_DIFF_BLOB_BYTES ? contents : null;
 }
 
-type Preparation = { ignoreWhitespace?: boolean; source?: DiffSource; blob?: string };
-type Prepared = { source?: DiffSource; blob?: string; result: FileDiffMetadata };
-const preparedByFile = new WeakMap<FileDiffMetadata, Map<boolean, Prepared>>();
-
 export function prepareFileDiff(
   file: FileDiffMetadata,
-  { source, blob, ignoreWhitespace = false }: Preparation = {}
+  { ignoreWhitespace = false, sha }: { ignoreWhitespace?: boolean; sha?: string | null } = {}
 ): FileDiffMetadata {
-  let prepared = preparedByFile.get(file);
-  if (prepared === undefined) {
-    prepared = new Map();
-    preparedByFile.set(file, prepared);
+  // Hand Pierre a fresh object: on-demand `loadDiffFiles` replaces top-level fields in place.
+  const cacheKey = file.cacheKey && sha ? `${file.cacheKey}:${sha}` : file.cacheKey;
+  const copy = cacheKey === file.cacheKey ? { ...file } : { ...file, cacheKey };
+  if (!ignoreWhitespace) return copy;
+  try {
+    return hideWhitespaceChanges(copy);
+  } catch {
+    // If filtering fails, show the unfiltered diff.
+    return copy;
   }
-  const cached = prepared.get(ignoreWhitespace);
-  if (cached && cached.source === source && cached.blob === blob) return cached.result;
-
-  let result = file;
-  if (source?.sha && blob !== undefined && canHydrateDiff(file)) {
-    try {
-      const old = reconstructOldFile(file, source, blob);
-      if (old !== null) {
-        result = hydratePartialDiff('clone', file, {
-          oldFile: { name: file.prevName ?? file.name, contents: old },
-          newFile: { name: file.name, contents: blob },
-        });
-        result.cacheKey = `${result.cacheKey ?? file.name}:${source.sha}`;
-      }
-    } catch {
-      // The original GitHub patch stays usable even if Pierre cannot hydrate it.
-    }
-  }
-  if (ignoreWhitespace) {
-    try {
-      result = hideWhitespaceChanges(result);
-    } catch {
-      // If filtering fails, show the unfiltered diff.
-    }
-  }
-  prepared.set(ignoreWhitespace, { source, blob, result });
-  return result;
 }
 
 function hideWhitespaceChanges(file: FileDiffMetadata): FileDiffMetadata {
