@@ -16,6 +16,7 @@ import type {
 import type { CodeViewAnnotationArgs, CodeViewHandle } from '@pierre/diffs/react';
 import type { GitStatus } from '@pierre/trees';
 import {
+  ChartBar,
   ChevronDown,
   ChevronRight,
   ChevronsDownUp,
@@ -26,6 +27,7 @@ import {
   Pilcrow,
   Rows3,
   TextWrap,
+  X,
 } from 'lucide-react';
 import {
   createContext,
@@ -44,7 +46,7 @@ import { DiffOptionsMenu } from './detail/DiffOptionsMenu';
 import { OffDiffThreads } from './detail/OffDiffThreads';
 import { ReviewThreadCard } from './detail/ReviewThreadCard';
 import { TruncatedNote } from './detail/TruncatedNote';
-import { isTestFile } from './diff/changedFileKind';
+import { isTestFile, type ChangedFileKind } from './diff/changedFileKind';
 import { useCodePrefs } from './diff/codePrefs';
 import {
   areAllDiffFilesCollapsed,
@@ -67,6 +69,14 @@ import {
   resolveFileDiffPath,
 } from './diff/diffRendering';
 import { orderDiffFiles } from './diff/fileOrder.logic';
+import { LineDistribution } from './diff/LineDistribution';
+import {
+  activeKindsFrom,
+  canHideKind,
+  normalizeDirPrefix,
+  summarizeByKind,
+  toDistributionFiles,
+} from './diff/lineDistribution.logic';
 import { StyledDiffCodeView } from './diff/StyledDiffCodeView';
 import { annotationsKey, placeThreads, type ThreadGroup } from './diff/threadAnnotations';
 import { useViewedFiles, type ViewedState } from './diff/viewedFiles';
@@ -466,12 +476,80 @@ export function CodeTab({
     () => new Map(preparedFiles.map((file) => [resolveFileDiffPath(file), file.cacheKey])),
     [preparedFiles]
   );
+  const distributionFiles = useMemo(() => toDistributionFiles(viewFiles ?? []), [viewFiles]);
+  const presentKinds = useMemo(
+    () => summarizeByKind(distributionFiles, 'total').map((entry) => entry.kind),
+    [distributionFiles]
+  );
+  // Directory drill-down resets when switching commits; non-test kind toggles stay in tab state.
+  const [storedDirFilter, setStoredDirFilter] = useState({ view, prefix: '' });
+  if (storedDirFilter.view !== view) setStoredDirFilter({ view, prefix: '' });
+  const rawDirPrefix = storedDirFilter.view === view ? storedDirFilter.prefix : '';
+  const setDirPrefix = useCallback(
+    (prefix: string) => setStoredDirFilter({ view, prefix }),
+    [view]
+  );
+  const [hiddenNonTestKinds, setHiddenNonTestKinds] = useState<ReadonlySet<ChangedFileKind>>(
+    () => new Set()
+  );
+  const activeKinds = useMemo(
+    () => activeKindsFrom(presentKinds, hideTests, hiddenNonTestKinds),
+    [presentKinds, hideTests, hiddenNonTestKinds]
+  );
+  const kindFilteredFiles = useMemo(
+    () => distributionFiles.filter((file) => activeKinds.has(file.kind)),
+    [distributionFiles, activeKinds]
+  );
+  const dirPrefix = useMemo(
+    () => normalizeDirPrefix(rawDirPrefix, kindFilteredFiles),
+    [rawDirPrefix, kindFilteredFiles]
+  );
+  const hiddenPresentNonTestCount = presentKinds.filter(
+    (kind) => kind !== 'test' && hiddenNonTestKinds.has(kind)
+  ).length;
+  const hasDistributionFilter = dirPrefix !== '' || hiddenPresentNonTestCount > 0;
+  const clearDistributionFilters = () => {
+    setDirPrefix('');
+    setHiddenNonTestKinds(new Set());
+  };
+  const toggleKind = useCallback(
+    (kind: ChangedFileKind) => {
+      if (activeKinds.has(kind)) {
+        if (!canHideKind(kind, activeKinds)) return;
+        if (kind === 'test') prefs.update({ hideTests: true });
+        else setHiddenNonTestKinds((prev) => new Set([...prev, kind]));
+      } else if (kind === 'test') {
+        prefs.update({ hideTests: false });
+      } else {
+        setHiddenNonTestKinds((prev) => {
+          const next = new Set(prev);
+          next.delete(kind);
+          return next;
+        });
+      }
+    },
+    [activeKinds, prefs]
+  );
+  const scopedDistributionFiles = useMemo(
+    () =>
+      dirPrefix
+        ? kindFilteredFiles.filter((file) => file.path.startsWith(dirPrefix))
+        : kindFilteredFiles,
+    [kindFilteredFiles, dirPrefix]
+  );
+  const includedPaths = useMemo(
+    () =>
+      hideTests || hasDistributionFilter
+        ? new Set(scopedDistributionFiles.map((file) => file.path))
+        : null,
+    [hideTests, hasDistributionFilter, scopedDistributionFiles]
+  );
   const shownDiffs = useMemo(
     () =>
-      hideTests
-        ? preparedFiles.filter((fileDiff) => !testPaths.has(resolveFileDiffPath(fileDiff)))
+      includedPaths
+        ? preparedFiles.filter((fileDiff) => includedPaths.has(resolveFileDiffPath(fileDiff)))
         : preparedFiles,
-    [preparedFiles, hideTests, testPaths]
+    [preparedFiles, includedPaths]
   );
 
   const [expandNotice, setExpandNotice] = useState<{ scope: string; path: string } | null>(null);
@@ -575,9 +653,9 @@ export function CodeTab({
   const withoutDiff = useMemo(() => {
     const parsed = new Set(parsedFiles.map(resolveFileDiffPath));
     return (viewFiles ?? []).filter(
-      (file) => !parsed.has(file.path) && !(hideTests && testPaths.has(file.path))
+      (file) => !parsed.has(file.path) && (!includedPaths || includedPaths.has(file.path))
     );
-  }, [viewFiles, parsedFiles, hideTests, testPaths]);
+  }, [viewFiles, parsedFiles, includedPaths]);
   // The files shown, in the order shown: the diffs, then the files without one.
   const listed = useMemo(
     () => [...shownDiffs.map(resolveFileDiffPath), ...withoutDiff.map((file) => file.path)],
@@ -736,17 +814,23 @@ export function CodeTab({
       rowsRef.current.get(path)?.scrollIntoView({ block: 'nearest' });
     }
     if (!moveFocus) return;
-    // Move focus out of the off-screen stacked tree to the revealed diff control (or the diffs
-    // container if the row is still virtualized). Also re-check on the next frame because Pierre's
-    // tree reclaims focus after onSelectionChange during the same click handler, and virtualized
-    // diff headers may not mount synchronously before CodeView finishes scrolling.
+    // Move focus out of the off-screen scroll-away header (stacked tree or Line Distribution) to
+    // the revealed diff control (or the diffs container if the row is still virtualized). Also
+    // re-check on the next frame because Pierre's tree reclaims focus after onSelectionChange
+    // during the same click handler, and virtualized diff headers may not mount synchronously
+    // before CodeView finishes scrolling.
     const moved = focusRevealedTarget(path, isDiffItem);
     revealFocusFrameRef.current = window.requestAnimationFrame(() => {
       revealFocusFrameRef.current = null;
       const active = document.activeElement;
-      const inStackedTree =
-        diffsRef.current?.querySelector('.mrpr-code-tree-stacked')?.contains(active) ?? false;
-      if (moved ? !inStackedTree : !inStackedTree && active !== null && active !== document.body) {
+      const inScrollAwayHeader = [
+        ...(diffsRef.current?.querySelectorAll('.mrpr-code-tree-stacked, .mrpr-dist') ?? []),
+      ].some((headerEl) => headerEl.contains(active));
+      if (
+        moved
+          ? !inScrollAwayHeader
+          : !inScrollAwayHeader && active !== null && active !== document.body
+      ) {
         return;
       }
       if (!focusRevealedTarget(path, isDiffItem)) {
@@ -790,7 +874,9 @@ export function CodeTab({
     : viewFiles.length === 0
       ? t(shownCommit === undefined ? 'code.noChanges' : 'code.noCommitChanges')
       : listed.length === 0
-        ? t('code.onlyTests')
+        ? hiddenPresentNonTestCount > 0
+          ? t('code.distribution.noMatchingFiles')
+          : t('code.onlyTests')
         : ignoreWhitespace &&
             withoutDiff.length === 0 &&
             shownDiffs.every(
@@ -842,18 +928,66 @@ export function CodeTab({
     );
   };
 
-  const renderStackedTree = stacked
-    ? () => (
-        <div className="mrpr-code-tree-stacked">
-          <DiffFileTree
-            ariaLabel={t('code.treeLabel', pullRequest)}
-            entries={entries}
-            initialExpansion="closed"
-            onSelectFile={(path) => reveal(path, true)}
-          />
-        </div>
-      )
-    : undefined;
+  const hasFiles = Boolean(viewFiles && viewFiles.length > 0);
+  const showDistribution = Boolean(prefs.showDistribution && hasDiffs);
+  const toggleDistribution = () => {
+    if (!hasDiffs) return;
+    const next = !prefs.showDistribution;
+    prefs.update({ showDistribution: next });
+    if (next) {
+      cancelRevealFocus();
+      const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+      viewerRef.current?.scrollTo({
+        type: 'position',
+        position: 0,
+        behavior: still ? 'instant' : 'smooth',
+      });
+    }
+  };
+  const filterChipText = dirPrefix
+    ? hiddenPresentNonTestCount > 0
+      ? t('code.distribution.dirFilterWithKinds', {
+          prefix: dirPrefix,
+          count: hiddenPresentNonTestCount,
+        })
+      : dirPrefix
+    : t('code.distribution.clearFilter');
+  const filterChipLabel = dirPrefix
+    ? t('code.distribution.clearDirFilter', { prefix: filterChipText })
+    : filterChipText;
+
+  const renderCodeViewHeader =
+    stacked || showDistribution
+      ? () => (
+          <>
+            {stacked ? (
+              <div className="mrpr-code-tree-stacked">
+                <DiffFileTree
+                  ariaLabel={t('code.treeLabel', pullRequest)}
+                  entries={entries}
+                  initialExpansion="closed"
+                  onSelectFile={(path) => reveal(path, true)}
+                />
+              </div>
+            ) : null}
+            {showDistribution ? (
+              <LineDistribution
+                files={distributionFiles}
+                scopedFiles={scopedDistributionFiles}
+                activeKinds={activeKinds}
+                dirPrefix={dirPrefix}
+                view={prefs.distributionView}
+                metric={prefs.distributionMetric}
+                onToggleKind={toggleKind}
+                onDirPrefixChange={setDirPrefix}
+                onViewChange={(distributionView) => prefs.update({ distributionView })}
+                onMetricChange={(distributionMetric) => prefs.update({ distributionMetric })}
+                onSelectFile={(path) => reveal(path, true)}
+              />
+            ) : null}
+          </>
+        )
+      : undefined;
 
   return (
     <div ref={rootRef} className="mrpr-root mrpr-code" style={pluginRootStyle()}>
@@ -876,6 +1010,18 @@ export function CodeTab({
                   onClick={() => prefs.update({ hideTests: false })}
                 >
                   {t('code.testsHidden', { count: hiddenTests })}
+                </button>
+              ) : null}
+              {hasDistributionFilter ? (
+                <button
+                  type="button"
+                  className="mrpr-filter-chip"
+                  aria-label={filterChipLabel}
+                  title={filterChipLabel}
+                  onClick={clearDistributionFilters}
+                >
+                  <span className="mrpr-truncate">{filterChipText}</span>
+                  <X aria-hidden className="mrpr-filter-chip-icon" />
                 </button>
               ) : null}
               {marked.length > 0 ? (
@@ -952,6 +1098,16 @@ export function CodeTab({
               <FlaskConicalOff aria-hidden className="mrpr-button-icon" />
             </ToolbarButton>
           ) : null}
+          {hasFiles ? (
+            <ToolbarButton
+              label={t('code.distribution.toggle')}
+              pressed={hasDiffs && prefs.showDistribution}
+              disabled={!hasDiffs}
+              onClick={toggleDistribution}
+            >
+              <ChartBar aria-hidden className="mrpr-button-icon" />
+            </ToolbarButton>
+          ) : null}
           {stacked ? (
             <ToolbarButton
               label={t('code.goToFiles')}
@@ -1013,6 +1169,11 @@ export function CodeTab({
       {viewFiles && emptyNote ? (
         <div className="mrpr-panel-note">
           <p className="mrpr-status">{emptyNote}</p>
+          {listed.length === 0 && hiddenPresentNonTestCount > 0 ? (
+            <button type="button" className="mrpr-link-button" onClick={clearDistributionFilters}>
+              {t('code.distribution.clearFilter')}
+            </button>
+          ) : null}
         </div>
       ) : viewFiles ? (
         <div className="mrpr-code-body">
@@ -1046,7 +1207,7 @@ export function CodeTab({
                   stickyHeaders: true,
                   loadDiffFiles: canLoadDiffFiles ? loadDiffFiles : undefined,
                 }}
-                renderCodeViewHeader={renderStackedTree}
+                renderCodeViewHeader={renderCodeViewHeader}
                 renderCodeViewFooter={renderWithoutDiff}
                 renderHeaderPrefix={renderHeaderPrefix}
                 renderHeaderMetadata={renderHeaderMetadata}
