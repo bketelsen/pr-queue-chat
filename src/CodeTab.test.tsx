@@ -770,6 +770,110 @@ describe('CodeTab', () => {
     expect(tab.getByRole('list', { name: /^Files of/ })).toBeTruthy();
   });
 
+  describe('responsive Files tree', () => {
+    let codeWidth = 400;
+    let clientWidth: { mockRestore(): void } | undefined;
+    let observers: { callback: ResizeObserverCallback; targets: Set<Element> }[] = [];
+    beforeEach(() => {
+      codeWidth = 400;
+      observers = [];
+      clientWidth = vi
+        .spyOn(HTMLElement.prototype, 'clientWidth', 'get')
+        .mockImplementation(function (this: HTMLElement) {
+          return this.classList.contains('mrpr-code') ? codeWidth : 0;
+        });
+      vi.stubGlobal(
+        'ResizeObserver',
+        class {
+          private readonly entry: (typeof observers)[number];
+          constructor(callback: ResizeObserverCallback) {
+            this.entry = { callback, targets: new Set() };
+            observers.push(this.entry);
+          }
+          observe(target: Element) {
+            this.entry.targets.add(target);
+          }
+          unobserve(target: Element) {
+            this.entry.targets.delete(target);
+          }
+          disconnect() {
+            this.entry.targets.clear();
+          }
+        }
+      );
+    });
+    afterEach(() => {
+      clientWidth?.mockRestore();
+    });
+    const resizeCode = (width: number) =>
+      act(async () => {
+        codeWidth = width;
+        for (const { callback, targets } of observers) {
+          const code = [...targets].find((target) => target.classList.contains('mrpr-code'));
+          if (code) {
+            callback(
+              [{ target: code, contentRect: { width } } as unknown as ResizeObserverEntry],
+              {} as ResizeObserver
+            );
+          }
+        }
+      });
+
+    it('starts closed when narrow, opens automatically when widened if untouched, and respects manual toggles', async () => {
+      const tab = await show();
+      const toggle = tab.getByRole('button', { name: 'Files' });
+      expect(toggle.getAttribute('aria-pressed')).toBe('false');
+      expect(tab.queryByRole('list', { name: /^Files of/ })).toBeNull();
+
+      // Widening across 640px opens the tree automatically while the user has not toggled it.
+      await resizeCode(640);
+      expect(toggle.getAttribute('aria-pressed')).toBe('true');
+      expect(tab.getByRole('list', { name: /^Files of/ })).toBeTruthy();
+
+      // Fractional widths below 640px (matching CSS `@container (min-inline-size: 640px)`) close it.
+      await resizeCode(639.5);
+      expect(toggle.getAttribute('aria-pressed')).toBe('false');
+      expect(tab.queryByRole('list', { name: /^Files of/ })).toBeNull();
+
+      // Opening manually keeps the tree open across resizes.
+      await click(toggle);
+      expect(toggle.getAttribute('aria-pressed')).toBe('true');
+      expect(tab.getByRole('list', { name: /^Files of/ })).toBeTruthy();
+      await resizeCode(700);
+      await resizeCode(400);
+      expect(toggle.getAttribute('aria-pressed')).toBe('true');
+      expect(tab.getByRole('list', { name: /^Files of/ })).toBeTruthy();
+    });
+
+    it('starts open when wide (>= 640px)', async () => {
+      codeWidth = 640;
+      const tab = await show();
+      expect(tab.getByRole('button', { name: 'Files' }).getAttribute('aria-pressed')).toBe('true');
+      expect(tab.getByRole('list', { name: /^Files of/ })).toBeTruthy();
+    });
+
+    it('moves focus to Files when narrowing auto-closes a focused tree, and leaves focus elsewhere alone', async () => {
+      codeWidth = 640;
+      const tab = await show();
+      const toggle = tab.getByRole('button', { name: 'Files' });
+      const fileButton = tab.getByRole('button', { name: 'src/app.ts' });
+      act(() => fileButton.focus());
+      expect(document.activeElement).toBe(fileButton);
+
+      await resizeCode(500);
+      expect(toggle.getAttribute('aria-pressed')).toBe('false');
+      expect(document.activeElement).toBe(toggle);
+
+      // Re-opening automatically via widening and focusing outside the tree leaves focus untouched.
+      await resizeCode(700);
+      const wrapButton = tab.getByRole('button', { name: 'Wrap lines' });
+      act(() => wrapButton.focus());
+      await resizeCode(600);
+      expect(toggle.getAttribute('aria-pressed')).toBe('false');
+      expect(document.activeElement).toBe(wrapButton);
+    });
+  });
+
   describe('review threads', () => {
     it('threads on rendered lines become annotations', async () => {
       const right = thread(1);
