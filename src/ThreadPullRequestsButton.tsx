@@ -19,7 +19,7 @@ import {
   type ThreadHeaderSlotComponent,
 } from '@mindroom/client-sdk/core';
 import { IconTooltip, Menu, PopOut } from '@mindroom/client-sdk/ui';
-import { pullRequestUrl, type PullRequestRef } from './github';
+import type { PullRequestRef } from './github';
 import {
   combinedPullRequestState,
   PULL_REQUEST_STATE_PRESENTATION,
@@ -28,16 +28,10 @@ import {
 } from './presentation';
 import { answerOf, pullRequestKey, STALE_TIME, unlessRefused, usePullRequests } from './queries';
 import { useShownPullRequest } from './shownPullRequest';
-import { Details, useBannerRefetch } from './ThreadDetails';
+import { Details, PullRequestMenuItem, useBannerRefetch } from './ThreadDetails';
 import { useThreadPullRequests, type ThreadWorktree } from './threadPullRequests';
 import { pluginRootStyle } from './theme';
 import { RoomGitHub, useGitHubAccess } from './token';
-
-/** Whether `a` and `b` name one pull request; GitHub's owner and repository names ignore case. */
-const samePullRequest = (a: PullRequestRef, b: PullRequestRef) =>
-  a.number === b.number &&
-  a.owner.toLowerCase() === b.owner.toLowerCase() &&
-  a.repo.toLowerCase() === b.repo.toLowerCase();
 
 export const ThreadPullRequestsButton: ThreadHeaderSlotComponent = ({ room, threadId }) => {
   const { pullRequests, worktree } = useThreadPullRequests(room, threadId);
@@ -174,33 +168,15 @@ function PullRequestsMenu({
         </div>
       );
     }
-    if (!panel) {
-      return (
-        <a
-          role="menuitem"
-          className="mrpr-thread-menu-item"
-          href={pullRequestUrl(pullRequest)}
-          target="_blank"
-          rel="noreferrer"
-          onClick={choose}
-        >
-          {rows}
-        </a>
-      );
-    }
     return (
-      <button
-        type="button"
-        role="menuitem"
-        className="mrpr-thread-menu-item"
-        aria-current={current && samePullRequest(current, pullRequest) ? 'true' : undefined}
-        onClick={() => {
-          choose();
-          panel.open(pullRequest);
-        }}
+      <PullRequestMenuItem
+        pullRequest={pullRequest}
+        panel={panel}
+        current={current}
+        onClose={choose}
       >
         {rows}
-      </button>
+      </PullRequestMenuItem>
     );
   };
 
