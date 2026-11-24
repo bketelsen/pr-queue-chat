@@ -1277,8 +1277,8 @@ test("Page Zoom scales the panel's text, its diffs and its file tree", async ({ 
     // Pierre draws the diff and the tree in open shadow roots, which locators enter.
     const line = panel(page).locator('[data-line]').filter({ hasText: 'ttl = 3600' }).first();
     await expect(line).toBeVisible({ timeout: 30_000 });
-    // The narrow panel starts with the file tree closed; open it to measure its rows too.
-    await panel(page).getByRole('button', { name: 'Files', exact: true, pressed: false }).click();
+    // The narrow panel starts with the stacked tree visible and folders collapsed; expand it to measure its rows.
+    await panel(page).getByRole('treeitem', { name: 'src / session' }).click();
     const row = panel(page).getByRole('treeitem', { name: 'store.ts' });
     await expect(row).toBeVisible();
     await shot(page, `zoom-${pageZoom}-code`);
@@ -1345,7 +1345,6 @@ test('a pinch zoom keeps the file tree as it was: folded folders, selection, foc
     timeout: 30_000,
   });
   await panel(page).getByRole('tab', { name: 'Code' }).click();
-  await panel(page).getByRole('button', { name: 'Files', exact: true, pressed: false }).click();
   const tree = panel(page).getByRole('tree');
   /** Scrolls the tree to `top`, and waits until its rows take the pointer again. */
   const scrollTree = async (top: number) => {
@@ -1361,9 +1360,13 @@ test('a pinch zoom keeps the file tree as it was: folded folders, selection, foc
       )
       .toBeNull();
   };
+  // Narrow panel starts with all folders collapsed; expand src / session while keeping docs folded.
   const docs = tree.getByRole('treeitem', { name: 'docs' });
-  await docs.click();
   await expect(docs).toHaveAttribute('aria-expanded', 'false');
+  const session = tree.getByRole('treeitem', { name: 'src / session' });
+  await expect(session).toHaveAttribute('aria-expanded', 'false');
+  await session.click();
+  await expect(session).toHaveAttribute('aria-expanded', 'true');
   // Scrolled down to a file the tree draws only there, which a click selects and focuses.
   // Its row is the 52nd, past the 10 the tree shows and the 10 more it draws after them.
   await scrollTree(49 * 24);
@@ -1373,6 +1376,12 @@ test('a pinch zoom keeps the file tree as it was: folded folders, selection, foc
     await file.click();
     await expect(file).toHaveAttribute('aria-selected', 'true', { timeout: 1_000 });
   }).toPass();
+  // Clicking a file reveals its diff, scrolling the stacked tree off-screen; jump back to Files
+  // before pinching so the tree is in view with part-50.ts still selected and focused.
+  await expect(file).not.toBeInViewport();
+  await panel(page).getByRole('button', { name: 'Go to files', exact: true }).click();
+  await expect(file).toBeInViewport();
+  await expect(file).toHaveAttribute('aria-selected', 'true');
   await expect(file).toBeFocused();
 
   // The trees Pierre makes from here on.
@@ -1413,8 +1422,9 @@ test('a pinch zoom keeps the file tree as it was: folded folders, selection, foc
   await expect(file).toHaveCSS('height', '36px');
   // Made once, after the zoom rested, not on each of its frames.
   expect(await treesMade()).toBe(1);
-  // Still scrolled to the file, which keeps the selection and the focus.
+  // Still scrolled to the file, which keeps the selection and the focus, while row 1 stays off-screen.
   await expect(file).toBeInViewport();
+  await expect(tree.getByRole('treeitem', { name: 'part-01.ts' })).not.toBeInViewport();
   await expect(file).toHaveAttribute('aria-selected', 'true');
   await expect(file).toBeFocused();
   // And at the top, the folder is still folded.
@@ -2749,11 +2759,30 @@ test('on a phone the header scrolls away under a bar that brings it back', async
   PULLS.sessionStore.body = LONG_BODY;
   try {
     await stubGitHub(page);
+    const phoneExtraPatch = (prefix: string) =>
+      `@@ -0,0 +1,45 @@\n${Array.from({ length: 45 }, (_, i) => `+export const ${prefix}${i + 1} = ${i + 1};`).join('\n')}`;
+    const phoneFiles = [
+      ZOOM_FILE,
+      {
+        filename: 'worker/queue.ts',
+        status: 'added',
+        additions: 45,
+        deletions: 0,
+        patch: phoneExtraPatch('queueStep'),
+      },
+      {
+        filename: 'worker/runner.ts',
+        status: 'added',
+        additions: 45,
+        deletions: 0,
+        patch: phoneExtraPatch('runnerStep'),
+      },
+    ];
     await page.route(
       (url) =>
         url.hostname === 'api.github.com' &&
         url.pathname === `${pullPath(PULLS.sessionStore)}/files`,
-      (route) => route.fulfill({ headers: CORS, json: [ZOOM_FILE] })
+      (route) => route.fulfill({ headers: CORS, json: phoneFiles })
     );
     await openRoom(page);
     await cardChips(page, roots.sessions, PULLS.sessionStore).click();
@@ -2807,33 +2836,96 @@ test('on a phone the header scrolls away under a bar that brings it back', async
     await expect(details).toHaveCount(0);
     await expect(panel(page).getByRole('link', { name: 'acme/webapp' })).toBeVisible();
 
-    // On the Code tab the header starts collapsed and the stacked Files tree starts closed.
+    // CI status stays visible in the tab bar across Summary, Timeline, and Code.
+    const checks = panel(page)
+      .locator('.mrpr-tabbar-end')
+      .getByRole('button', { name: /^Open checks:/ });
+    await expect(checks).toBeVisible();
+
+    await panel(page).getByRole('tab', { name: 'Timeline' }).click();
+    await expect(checks).toBeVisible();
+    await expect(panel(page).locator('.mrpr-timeline-bar')).toBeVisible();
+    await expect(panel(page).getByRole('button', { name: 'Newest first' })).toBeVisible();
+
+    // On the Code tab the header starts expanded and the stacked Files tree starts visible
+    // inside CodeView's header with all folders collapsed.
     await panel(page).getByRole('tab', { name: 'Code' }).click();
-    await expect(details).toBeVisible();
-    await expect(details).toHaveAttribute('aria-expanded', 'false');
-    await expect(title).toBeHidden();
-    const filesToggle = panel(page).getByRole('button', { name: 'Files', exact: true });
-    await expect(filesToggle).toHaveAttribute('aria-pressed', 'false');
-    await expect(panel(page).getByRole('tree')).toHaveCount(0);
+    await expect(checks).toBeVisible();
+    await expect(title).toBeVisible();
+    await expect(details).toHaveCount(0);
+    const hide = panel(page).getByRole('button', { name: 'Hide pull request details' });
+    await expect(hide).toBeVisible();
+    await expect(hide).toHaveAttribute('aria-expanded', 'true');
+    const goToFiles = panel(page).getByRole('button', { name: 'Go to files', exact: true });
+    await expect(goToFiles).toBeVisible();
+    await expect(goToFiles).not.toHaveAttribute('aria-pressed');
+    const sessionFolder = panel(page).getByRole('treeitem', { name: 'src / session' });
+    await expect(sessionFolder).toBeVisible();
+    await expect(sessionFolder).toHaveAttribute('aria-expanded', 'false');
+    await expect(panel(page).getByRole('treeitem', { name: 'store.ts' })).toHaveCount(0);
     await expect(
       panel(page).locator('[data-line]').filter({ hasText: 'ttl = 3600' }).first()
     ).toBeVisible({ timeout: 30_000 });
+    await shot(page, 'code-expanded');
+
+    // Manual ^ collapse and expand in place.
+    await hide.click();
+    await expect(title).toBeHidden();
+    await expect(details).toBeVisible();
+    await expect(details).toHaveAttribute('aria-expanded', 'false');
     await shot(page, 'code-collapsed');
 
     await details.click();
     await expect(title).toBeVisible();
-    const hide = panel(page).getByRole('button', { name: 'Hide pull request details' });
     await expect(hide).toBeVisible();
-    await expect(hide).toHaveAttribute('aria-expanded', 'true');
-    await shot(page, 'code-expanded');
 
-    await hide.click();
-    await expect(title).toBeHidden();
-    await expect(details).toBeVisible();
-
-    await filesToggle.click();
-    await expect(filesToggle).toHaveAttribute('aria-pressed', 'true');
+    // Expanding a folder reveals its files; choosing a later file scrolls the stacked tree out of
+    // view and moves focus to the revealed diff, and Go to files returns focus to the active row.
+    await sessionFolder.click();
+    await expect(sessionFolder).toHaveAttribute('aria-expanded', 'true');
     await expect(panel(page).getByRole('treeitem', { name: 'store.ts' })).toBeVisible();
+    const workerFolder = panel(page).getByRole('treeitem', { name: 'worker' });
+    await workerFolder.click();
+    await expect(workerFolder).toHaveAttribute('aria-expanded', 'true');
+    const runnerRow = panel(page).getByRole('treeitem', { name: 'runner.ts' });
+    await expect(runnerRow).toBeVisible();
+    await runnerRow.click();
+    await expect(sessionFolder).not.toBeInViewport();
+    await expect(runnerRow).not.toBeFocused();
+    const focusOnDiff = () =>
+      panel(page)
+        .locator('.mrpr-code-diffs')
+        .evaluate(
+          (diffs) =>
+            diffs.contains(document.activeElement) &&
+            !(
+              diffs.querySelector('.mrpr-code-tree-stacked')?.contains(document.activeElement) ??
+              false
+            )
+        );
+    await expect.poll(focusOnDiff).toBe(true);
+    await goToFiles.click();
+    await expect(sessionFolder).toBeInViewport();
+    await expect(runnerRow).toBeFocused();
+    await expect
+      .poll(() =>
+        panel(page)
+          .locator('.mrpr-code-tree-stacked file-tree-container')
+          .evaluate((element) => element.shadowRoot?.activeElement?.getAttribute('role'))
+      )
+      .toBe('treeitem');
+
+    // Keyboard activation (ArrowUp -> Enter) also moves focus out of the off-screen stacked tree
+    // to the diff, and Go to files restores focus to that newly activated row.
+    const queueRow = panel(page).getByRole('treeitem', { name: 'queue.ts' });
+    await page.keyboard.press('ArrowUp');
+    await expect(queueRow).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(queueRow).not.toBeFocused();
+    await expect.poll(focusOnDiff).toBe(true);
+    await goToFiles.click();
+    await expect(sessionFolder).toBeInViewport();
+    await expect(queueRow).toBeFocused();
   } finally {
     PULLS.sessionStore.body = body;
     await context.close();

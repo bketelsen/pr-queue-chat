@@ -31,6 +31,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -124,6 +125,7 @@ type FileHeaderState = {
   setViewed(path: string, extendRange: boolean): void;
   foldedOf(path: string): boolean;
   toggleFolded(path: string): void;
+  foldButtons: Map<string, HTMLButtonElement>;
 };
 
 const FileHeaderContext = createContext<FileHeaderState | null>(null);
@@ -131,10 +133,22 @@ const FileHeaderContext = createContext<FileHeaderState | null>(null);
 function FoldToggle({ path }: { path: string }) {
   const t = usePluginTranslation('pull-requests');
   const header = useContext(FileHeaderContext);
+  const foldButtons = header?.foldButtons;
+  const buttonRef = useCallback(
+    (node: HTMLButtonElement | null) => {
+      if (!foldButtons || !node) return undefined;
+      foldButtons.set(path, node);
+      return () => {
+        if (foldButtons.get(path) === node) foldButtons.delete(path);
+      };
+    },
+    [foldButtons, path]
+  );
   if (!header) return null;
   const folded = header.foldedOf(path);
   return (
     <button
+      ref={buttonRef}
       type="button"
       className="mrpr-fold-toggle"
       aria-expanded={!folded}
@@ -214,6 +228,7 @@ const renderAnnotation = (...[annotation]: CodeViewAnnotationArgs<ThreadGroup>) 
 function ToolbarButton({
   label,
   pressed,
+  disabled,
   buttonRef,
   onClick,
   children,
@@ -221,6 +236,7 @@ function ToolbarButton({
   label: string;
   /** Whether a toggle is on; undefined for a button that acts. */
   pressed?: boolean;
+  disabled?: boolean;
   buttonRef?: { current: HTMLButtonElement | null };
   onClick: () => void;
   children: ReactNode;
@@ -237,6 +253,7 @@ function ToolbarButton({
           radii="300"
           aria-label={label}
           aria-pressed={pressed}
+          disabled={disabled}
           onClick={onClick}
         >
           {children}
@@ -245,6 +262,17 @@ function ToolbarButton({
     </IconTooltip>
   );
 }
+
+/** Moves focus into the file tree without triggering a competing native scroll. */
+const focusTree = (tree: HTMLElement | null) => {
+  const root = tree?.querySelector('file-tree-container')?.shadowRoot ?? tree;
+  const target =
+    root?.querySelector<HTMLElement>('[role="treeitem"][tabindex="0"]') ??
+    root?.querySelector<HTMLElement>('[role="treeitem"]') ??
+    root?.querySelector<HTMLElement>('[role="tree"]') ??
+    tree?.querySelector<HTMLElement>('.mrpr-tree-header button');
+  target?.focus({ preventScroll: true });
+};
 
 /** The folds of one view: the pull request as a whole, or one commit. */
 type Folds = {
@@ -283,15 +311,17 @@ export function CodeTab({
   const prefs = useCodePrefs();
   const viewed = useViewedFiles(pullRequest);
   const rootRef = useRef<HTMLDivElement>(null);
+  const diffsRef = useRef<HTMLDivElement>(null);
   const filesButtonRef = useRef<HTMLButtonElement | null>(null);
   const refocusFiles = useRef(false);
-  // Start with the Files tree closed when stacked above the diffs (< 640px).
+  // Wide (>= 640px): resizable Files sidebar starting open with all folders expanded.
+  // Stacked (< 640px): Files tree renders inside CodeView's header with all folders collapsed.
   const [wide, setWide] = useState<boolean | null>(() =>
     typeof ResizeObserver === 'undefined' ? true : null
   );
-  const [treeChoice, setTreeChoice] = useState<boolean | null>(null);
-  const treeAutoRef = useRef(true);
-  treeAutoRef.current = treeChoice === null;
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const wideRef = useRef(wide);
+  wideRef.current = wide;
   useLayoutEffect(() => {
     const root = rootRef.current;
     if (!root || typeof ResizeObserver === 'undefined') return undefined;
@@ -303,9 +333,9 @@ export function CodeTab({
       const nextWide = width >= WIDE_TREE_MIN_WIDTH;
       if (
         fromResize &&
-        !nextWide &&
-        treeAutoRef.current &&
-        (root.querySelector('.mrpr-code-tree')?.contains(document.activeElement) ?? false)
+        wideRef.current !== null &&
+        wideRef.current !== nextWide &&
+        (root.querySelector('.mrpr-tree')?.contains(document.activeElement) ?? false)
       ) {
         refocusFiles.current = true;
       }
@@ -321,16 +351,26 @@ export function CodeTab({
     observer.observe(root);
     return () => observer.disconnect();
   }, []);
-  const treeOpen = treeChoice ?? wide ?? false;
   useLayoutEffect(() => {
     if (!refocusFiles.current) return;
     refocusFiles.current = false;
-    if (!treeOpen) filesButtonRef.current?.focus({ preventScroll: true });
-  }, [treeOpen]);
+    filesButtonRef.current?.focus({ preventScroll: true });
+  }, [wide]);
+  const stacked = wide === false;
+  const showSidebar = wide === true && sidebarOpen;
   const access = useGitHubAccess();
   const canLoadDiffFiles = access.via !== undefined && !access.pending;
   const viewerRef = useRef<CodeViewHandle<ThreadGroup, undefined>>(null);
   const rowsRef = useRef(new Map<string, HTMLElement>());
+  const foldButtonsRef = useRef(new Map<string, HTMLButtonElement>());
+  const revealFocusFrameRef = useRef<number | null>(null);
+  const cancelRevealFocus = useCallback(() => {
+    if (revealFocusFrameRef.current !== null) {
+      window.cancelAnimationFrame(revealFocusFrameRef.current);
+      revealFocusFrameRef.current = null;
+    }
+  }, []);
+  useEffect(() => cancelRevealFocus, [cancelRevealFocus, stacked]);
 
   // A commit opened from the Timeline or left chosen across a force-push may no longer be part of
   // the pull request; it reads as All commits then, and its files are not asked for.
@@ -653,6 +693,7 @@ export function CodeTab({
     setViewed,
     foldedOf: collapsedOf,
     toggleFolded,
+    foldButtons: foldButtonsRef.current,
   };
   const allFolded = areAllDiffFilesCollapsed(
     items.map((item) => item.id),
@@ -673,8 +714,19 @@ export function CodeTab({
     }
   };
 
-  const reveal = (path: string) => {
-    if (items.some((item) => item.id === path)) {
+  const focusRevealedTarget = (path: string, isDiffItem: boolean): boolean => {
+    const target = isDiffItem ? foldButtonsRef.current.get(path) : rowsRef.current.get(path);
+    if (target?.isConnected) {
+      target.focus({ preventScroll: true });
+      return true;
+    }
+    return false;
+  };
+
+  const reveal = (path: string, moveFocus = false) => {
+    cancelRevealFocus();
+    const isDiffItem = items.some((item) => item.id === path);
+    if (isDiffItem) {
       // A folded file opens as it is revealed, and stays open as its mark changes.
       updateFolds((current) => ({
         choices: withFileDiffFold(current.choices, foldKeyOf(path), false),
@@ -683,6 +735,24 @@ export function CodeTab({
     } else {
       rowsRef.current.get(path)?.scrollIntoView({ block: 'nearest' });
     }
+    if (!moveFocus) return;
+    // Move focus out of the off-screen stacked tree to the revealed diff control (or the diffs
+    // container if the row is still virtualized). Also re-check on the next frame because Pierre's
+    // tree reclaims focus after onSelectionChange during the same click handler, and virtualized
+    // diff headers may not mount synchronously before CodeView finishes scrolling.
+    const moved = focusRevealedTarget(path, isDiffItem);
+    revealFocusFrameRef.current = window.requestAnimationFrame(() => {
+      revealFocusFrameRef.current = null;
+      const active = document.activeElement;
+      const inStackedTree =
+        diffsRef.current?.querySelector('.mrpr-code-tree-stacked')?.contains(active) ?? false;
+      if (moved ? !inStackedTree : !inStackedTree && active !== null && active !== document.body) {
+        return;
+      }
+      if (!focusRevealedTarget(path, isDiffItem)) {
+        diffsRef.current?.focus({ preventScroll: true });
+      }
+    });
   };
 
   const renderWithoutDiff = () =>
@@ -692,6 +762,7 @@ export function CodeTab({
           <li
             key={file.path}
             className="mrpr-no-diff"
+            tabIndex={-1}
             ref={(row) => {
               if (row) rowsRef.current.set(file.path, row);
               else rowsRef.current.delete(file.path);
@@ -729,6 +800,60 @@ export function CodeTab({
             )
           ? t('code.onlyWhitespace')
           : undefined;
+  const hasDiffs = Boolean(viewFiles && !emptyNote);
+
+  // Give the stacked tree inside CodeView's auto-height header a concrete max-block-size derived
+  // from the diffs viewport height (percentage max-block-size resolves to none there).
+  useLayoutEffect(() => {
+    const diffs = diffsRef.current;
+    if (!diffs) return undefined;
+    if (!stacked) {
+      diffs.style.removeProperty('--mrpr-stacked-tree-max-height');
+      return undefined;
+    }
+    const apply = (height: number) => {
+      if (height > 0) {
+        diffs.style.setProperty('--mrpr-stacked-tree-max-height', `${Math.round(height * 0.45)}px`);
+      }
+    };
+    apply(diffs.getBoundingClientRect().height || diffs.clientHeight);
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries?.[entries.length - 1];
+      const height =
+        entry?.contentRect.height ?? (diffs.getBoundingClientRect().height || diffs.clientHeight);
+      apply(height);
+    });
+    observer.observe(diffs);
+    return () => observer.disconnect();
+  }, [hasDiffs, stacked]);
+
+  const goToFiles = () => {
+    if (!hasDiffs) return;
+    cancelRevealFocus();
+    const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    viewerRef.current?.scrollTo({
+      type: 'position',
+      position: 0,
+      behavior: still ? 'instant' : 'smooth',
+    });
+    focusTree(
+      diffsRef.current?.querySelector<HTMLElement>('.mrpr-code-tree-stacked .mrpr-tree') ?? null
+    );
+  };
+
+  const renderStackedTree = stacked
+    ? () => (
+        <div className="mrpr-code-tree-stacked">
+          <DiffFileTree
+            ariaLabel={t('code.treeLabel', pullRequest)}
+            entries={entries}
+            initialExpansion="closed"
+            onSelectFile={(path) => reveal(path, true)}
+          />
+        </div>
+      )
+    : undefined;
 
   return (
     <div ref={rootRef} className="mrpr-root mrpr-code" style={pluginRootStyle()}>
@@ -827,17 +952,28 @@ export function CodeTab({
               <FlaskConicalOff aria-hidden className="mrpr-button-icon" />
             </ToolbarButton>
           ) : null}
-          <ToolbarButton
-            label={t('code.files')}
-            pressed={treeOpen}
-            buttonRef={filesButtonRef}
-            onClick={() => {
-              refocusFiles.current = false;
-              setTreeChoice(!treeOpen);
-            }}
-          >
-            <FolderTree aria-hidden className="mrpr-button-icon" />
-          </ToolbarButton>
+          {stacked ? (
+            <ToolbarButton
+              label={t('code.goToFiles')}
+              disabled={!hasDiffs}
+              buttonRef={filesButtonRef}
+              onClick={goToFiles}
+            >
+              <FolderTree aria-hidden className="mrpr-button-icon" />
+            </ToolbarButton>
+          ) : (
+            <ToolbarButton
+              label={t('code.files')}
+              pressed={sidebarOpen}
+              buttonRef={filesButtonRef}
+              onClick={() => {
+                refocusFiles.current = false;
+                setSidebarOpen((open) => !open);
+              }}
+            >
+              <FolderTree aria-hidden className="mrpr-button-icon" />
+            </ToolbarButton>
+          )}
         </div>
       </div>
       {/* A list that did not load leaves the diffs whole; it says so, with a retry, above them. */}
@@ -880,16 +1016,22 @@ export function CodeTab({
         </div>
       ) : viewFiles ? (
         <div className="mrpr-code-body">
-          {treeOpen ? (
+          {showSidebar ? (
             <FileTreeColumn>
               <DiffFileTree
                 ariaLabel={t('code.treeLabel', pullRequest)}
                 entries={entries}
+                initialExpansion="open"
                 onSelectFile={reveal}
               />
             </FileTreeColumn>
           ) : null}
-          <div className="mrpr-code-diffs" onClickCapture={onDiffsClickCapture}>
+          <div
+            ref={diffsRef}
+            className="mrpr-code-diffs"
+            tabIndex={-1}
+            onClickCapture={onDiffsClickCapture}
+          >
             <FileHeaderContext.Provider value={header}>
               {/* The viewer must own its scroll element to position virtual rows within it. */}
               <StyledDiffCodeView<ThreadGroup>
@@ -904,6 +1046,7 @@ export function CodeTab({
                   stickyHeaders: true,
                   loadDiffFiles: canLoadDiffFiles ? loadDiffFiles : undefined,
                 }}
+                renderCodeViewHeader={renderStackedTree}
                 renderCodeViewFooter={renderWithoutDiff}
                 renderHeaderPrefix={renderHeaderPrefix}
                 renderHeaderMetadata={renderHeaderMetadata}
