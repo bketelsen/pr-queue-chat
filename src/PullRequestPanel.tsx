@@ -1,6 +1,7 @@
 // Ported from T3 Code (https://github.com/pingdotgg/t3code, apps/web/src/components/pullRequest/PullRequestDetailLayout.tsx and PullRequestDetailCrumbs.tsx at 8ab427c6), MIT, Copyright (c) 2026 T3 Tools Inc. See NOTICE.
 // The side panel: the header of the pull request a link opened, then its Summary and its Code.
-// It shows its own name and Close (`title: 'own'`), so the room draws no title row above it.
+// It shows its own name and control pill (`title: 'own'`, `frameControls: 'own'`), so the room
+// draws no title row or open frame strip around it.
 import {
   useContext,
   useEffect,
@@ -14,8 +15,8 @@ import {
   type RefObject,
 } from 'react';
 import { IconButton as PlainIconButton } from 'folds';
-import { ArrowLeft, ChevronDown, ChevronUp, FileDiff, X } from 'lucide-react';
-import { usePluginTranslation, useRoomSidePanel } from '@mindroom/client-sdk/core';
+import { ArrowLeft, ChevronDown, ChevronUp, FileDiff } from 'lucide-react';
+import { usePanelFrame, usePluginTranslation } from '@mindroom/client-sdk/core';
 import { IconTooltip } from '@mindroom/client-sdk/ui';
 import { useHeaderActions } from './actions/HeaderActions';
 import { usePullRequestActions } from './actions/usePullRequestActions';
@@ -33,6 +34,7 @@ import {
   type PullRequestRef,
 } from './github';
 import { GitHubErrorState, useErrorTokenReason } from './GitHubErrorState';
+import { PanelControlPill } from './PanelControlPill';
 import {
   PullRequestActorLabel,
   PullRequestMetaLine,
@@ -134,33 +136,6 @@ function TabBar({
   );
 }
 
-/** The panel's own Close (`title: 'own'`): the room draws no title row above the panel. */
-function CloseButton() {
-  const t = usePluginTranslation('pull-requests');
-  const panel = useRoomSidePanel('pull-requests', 'pull-request');
-  if (!panel) return null;
-  const label = t('closePanel');
-  return (
-    <IconTooltip label={label} align="End">
-      {(triggerRef) => (
-        // As the menu's button beside it, without a fill.
-        <PlainIconButton
-          ref={triggerRef}
-          size="300"
-          radii="300"
-          variant="SurfaceVariant"
-          fill="None"
-          className="mrpr-header-more"
-          aria-label={label}
-          onClick={panel.close}
-        >
-          <X aria-hidden className="mrpr-button-icon" />
-        </PlainIconButton>
-      )}
-    </IconTooltip>
-  );
-}
-
 /** The box that scrolls the panel: the nearest ancestor whose content scrolls, the room's. */
 function scrollerOf(element: HTMLElement): HTMLElement | null {
   for (let node = element.parentElement; node; node = node.parentElement) {
@@ -184,12 +159,21 @@ function useScrolledAway(
   useEffect(() => {
     const element = bar.current;
     if (!element || typeof ResizeObserver === 'undefined') return undefined;
+    const panel = element.closest<HTMLElement>('.mrpr-panel');
     const observer = new ResizeObserver((entries) => {
       const entry = entries[entries.length - 1];
-      if (entry) setBarSize(Math.round(entry.contentRect.height));
+      if (!entry) return;
+      const borderHeight =
+        entry.borderBoxSize?.[0]?.blockSize ?? element.getBoundingClientRect().height;
+      const height = Math.round(borderHeight > 0 ? borderHeight : entry.contentRect.height);
+      setBarSize(height);
+      if (panel && height > 0) panel.style.setProperty('--mrpr-bar-actual-size', `${height}px`);
     });
     observer.observe(element);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      panel?.style.removeProperty('--mrpr-bar-actual-size');
+    };
   }, [bar]);
   useEffect(() => {
     const element = header.current;
@@ -377,7 +361,7 @@ function Header({
             </>
           )}
         </span>
-        <span className="mrpr-bar-end">
+        <PanelControlPill>
           {!scrolls && !collapsed && !holds ? (
             <IconTooltip label={t('hideDetails')} align="End">
               {(triggerRef) => (
@@ -402,8 +386,7 @@ function Header({
             </IconTooltip>
           ) : null}
           {menu}
-          <CloseButton />
-        </span>
+        </PanelControlPill>
       </div>
       <div
         ref={headerRef}
@@ -643,11 +626,20 @@ function Panel({ roomId, request }: PanelProps) {
   // Summary and Timeline scroll with the header, in the room's box; the Code tab scrolls in
   // itself, under a header that starts expanded and can collapse into the top row.
   const scrolls = tab !== 'code';
+  const frame = usePanelFrame();
+  const framed = frame !== undefined && frame.layout !== 'folded';
+  const panelClassName = [
+    'mrpr-root mrpr-panel',
+    scrolls ? 'mrpr-panel-scrolls' : undefined,
+    framed ? 'mrpr-panel-framed' : undefined,
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   return (
     <div
       ref={root}
-      className={scrolls ? 'mrpr-root mrpr-panel mrpr-panel-scrolls' : 'mrpr-root mrpr-panel'}
+      className={panelClassName}
       style={pluginRootStyle()}
       onFocus={() => {
         focused.current = true;
@@ -660,12 +652,10 @@ function Panel({ roomId, request }: PanelProps) {
         <RemovedTokenNote className="mrpr-status mrpr-panel-removed" />
         {!ref || !pr || !state ? (
           <>
-            {/* The panel's name and Close until a pull request shows. */}
+            {/* The panel's name and control pill until a pull request shows. */}
             <div className="mrpr-crumbs mrpr-bar">
               <h2 className="mrpr-bar-label mrpr-truncate">{t('panelLabel')}</h2>
-              <span className="mrpr-bar-end">
-                <CloseButton />
-              </span>
+              <PanelControlPill />
             </div>
             {!ref ? (
               <p className="mrpr-status mrpr-panel-note">{t('emptyPanel')}</p>
