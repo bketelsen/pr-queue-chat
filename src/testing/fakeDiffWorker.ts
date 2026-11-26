@@ -3,12 +3,19 @@ import { vi } from 'vitest';
 export interface FakeDiffWorkerRecord {
   url: string | URL;
   terminate: ReturnType<typeof vi.fn>;
+  emitError(event?: unknown): void;
 }
 
-export function createFakeDiffWorkerClass(created: FakeDiffWorkerRecord[]) {
+export function createFakeDiffWorkerClass(
+  created: FakeDiffWorkerRecord[],
+  options?: { failInitialize?: boolean }
+) {
   return class FakeDiffWorker {
     listeners = new Map<string, Set<(event: unknown) => void>>();
-    terminate = vi.fn();
+    terminated = false;
+    terminate = vi.fn(() => {
+      this.terminated = true;
+    });
     url: string | URL;
     constructor(url: string | URL) {
       this.url = url;
@@ -19,9 +26,21 @@ export function createFakeDiffWorkerClass(created: FakeDiffWorkerRecord[]) {
       set.add(listener);
       this.listeners.set(type, set);
     }
+    emitError(event: unknown = new Event('error')) {
+      if (this.terminated) return;
+      for (const listener of this.listeners.get('error') ?? []) {
+        listener(event);
+      }
+    }
     postMessage(request: { id?: string; type?: string }) {
+      if (this.terminated) return;
       if (request.type === 'initialize') {
         queueMicrotask(() => {
+          if (this.terminated) return;
+          if (options?.failInitialize) {
+            this.emitError(new Event('error'));
+            return;
+          }
           for (const listener of this.listeners.get('message') ?? []) {
             listener({
               data: {
