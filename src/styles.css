@@ -2504,6 +2504,12 @@ button.mrpr-thread-menu-item[aria-current='true'] {
 .mrpr-dist [data-kind='generated'] {
   --mrpr-kind-color: var(--pr-kind-generated);
 }
+.mrpr-dist [data-net='added'] {
+  --mrpr-kind-color: var(--pr-net-added);
+}
+.mrpr-dist [data-net='removed'] {
+  --mrpr-kind-color: var(--pr-net-removed);
+}
 
 .mrpr-filter-chip:focus-visible,
 .mrpr-dist-chip:focus-visible,
@@ -2837,6 +2843,9 @@ button.mrpr-thread-menu-item[aria-current='true'] {
   color: var(--pr-muted);
   text-align: end;
 }
+.mrpr-dist-net-zero {
+  color: var(--pr-muted);
+}
 
 .mrpr-dist-bar-track {
   grid-column: 1 / -1;
@@ -2893,6 +2902,17 @@ button.mrpr-thread-menu-item[aria-current='true'] {
   stroke-width: 0.75;
 }
 
+.mrpr-dist-icicle-empty {
+  padding-block: 0.75rem;
+  padding-inline: 0.5rem;
+  border: 1px solid var(--pr-border);
+  border-radius: 0.3125rem;
+  background: var(--pr-surface-subtle);
+  color: var(--pr-muted);
+  font-size: 0.75rem;
+  text-align: center;
+}
+
 .mrpr-dist-icicle-root-label,
 .mrpr-dist-icicle-label {
   font-family: var(--pr-font-mono);
@@ -2921,6 +2941,18 @@ button.mrpr-thread-menu-item[aria-current='true'] {
 }
 .mrpr-dist-icicle-sub {
   fill: var(--pr-kind-on-fill);
+}
+
+.mrpr-dist-net-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3125rem;
+}
+.mrpr-dist-swatch {
+  inline-size: 0.5625rem;
+  block-size: 0.5625rem;
+  border-radius: 0.125rem;
+  background: var(--mrpr-kind-color);
 }
 
 .mrpr-dist-foot {

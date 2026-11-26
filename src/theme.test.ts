@@ -30,4 +30,15 @@ describe('pluginRootStyle', () => {
       '--pr-surface-subtle-hover': color.SurfaceVariant.ContainerHover,
     });
   });
+
+  it('uses fixed high-contrast Net icicle tile colors matching the categorical palette', () => {
+    const style = pluginRootStyle() as Record<string, unknown>;
+    expect(style).toMatchObject({
+      '--pr-net-added': '#176644',
+      '--pr-net-removed': '#923b41',
+      '--pr-kind-on-fill': '#ffffff',
+    });
+    expect(style['--pr-net-on-added']).toBeUndefined();
+    expect(style['--pr-net-on-removed']).toBeUndefined();
+  });
 });

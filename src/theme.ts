@@ -29,6 +29,8 @@ export function pluginRootStyle(): CSSProperties {
     '--pr-kind-test': '#8957e5',
     '--pr-kind-docs': '#9a6700',
     '--pr-kind-generated': '#656d76',
+    '--pr-net-added': '#176644',
+    '--pr-net-removed': '#923b41',
     '--pr-kind-on-fill': '#ffffff',
     '--pr-primary': color.Primary.Main,
     '--pr-on-primary': color.Primary.OnMain,
