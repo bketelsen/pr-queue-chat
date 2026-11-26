@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { notifyManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act } from '../testing/act';
 import { MindroomServerError, type MindroomServer } from '@mindroom/client-sdk/server';
 import { renderPluginComponent } from '@mindroom/client-sdk/testing';
@@ -8,6 +8,7 @@ import { GitHubWriteError, type PullRequest, type PullRequestRef } from '../gith
 import plugin from '../index';
 import { usePullRequest, usePullRequestFiles } from '../queries';
 import { GitHubServerContext, useGitHubToken } from '../token';
+import { primaryControl } from './actions.logic';
 import { resetPullRequestActions, usePullRequestActions } from './usePullRequestActions';
 
 const STORAGE = 'mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/';
@@ -510,6 +511,7 @@ describe('usePullRequestActions', () => {
     await answerHeld();
     await waitUntil(() => expect(actions.pending).toBeNull());
     expect(shown?.state).toBe('merged');
+    expect(shown?.mergedAt).toBe('2026-11-16T00:00:00Z');
     expect(actions.result).toEqual({ action: 'merge', outcome: 'done' });
     expect(writes()).toEqual([`PUT ${PULL_URL}/merge`]);
   });
@@ -544,6 +546,57 @@ describe('usePullRequestActions', () => {
     await waitUntil(() => expect(both[0]!.repo).toBeDefined());
     await waitUntil(() => expect(both[1]!.repo).toBeDefined());
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays merged across stale open reads after a confirmed merge, then adopts real merged metadata', async () => {
+    await showPanel();
+    pullAnswer = async () => respond(apiPull());
+    act(() => actions.perform('merge'));
+    await waitUntil(() => expect(actions.pending).toBeNull());
+    expect(actions.result).toEqual({ action: 'merge', outcome: 'done' });
+    expect(shown?.state).toBe('merged');
+    expect(shown?.mergedAt).toBeNull();
+    expect(primaryControl(shown!, actions.repo!, undefined)).toBe('merged');
+    expect(pullReads()[1]![1]?.cache).toBe('reload');
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['pull-requests', 'pr', 'o', 'r', 7, true] });
+    });
+    expect(shown?.state).toBe('merged');
+    expect(primaryControl(shown!, actions.repo!, undefined)).toBe('merged');
+    pullAnswer = async () =>
+      respond(apiPull({ state: 'closed', merged_at: '2026-11-16T00:00:00Z' }));
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['pull-requests', 'pr', 'o', 'r', 7, true] });
+    });
+    await waitUntil(() => expect(shown?.mergedAt).toBe('2026-11-16T00:00:00Z'));
+    expect(shown?.state).toBe('merged');
+  });
+
+  it('schedules one delayed reload with cache reload after close when the immediate read is stale', async () => {
+    await showPanel();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    notifyManager.setScheduler(queueMicrotask);
+    try {
+      pullAnswer = async () => respond(apiPull());
+      act(() => actions.perform('close'));
+      await pass(0);
+      await pass(0);
+      expect(actions.pending).toBeNull();
+      expect(actions.result).toEqual({ action: 'close', outcome: 'done' });
+      expect(shown?.state).toBe('open');
+      expect(pullReads()).toHaveLength(2);
+      expect(pullReads()[1]![1]?.cache).toBe('reload');
+      pullAnswer = async () =>
+        respond(apiPull({ state: 'closed', closed_at: '2026-11-16T00:00:00Z' }));
+      await pass(1_000);
+      expect(pullReads()).toHaveLength(3);
+      expect(pullReads()[2]![1]?.cache).toBe('reload');
+      expect(shown?.state).toBe('closed');
+      await pass(10_000);
+      expect(pullReads()).toHaveLength(3);
+    } finally {
+      notifyManager.setScheduler((callback) => setTimeout(callback, 0));
+    }
   });
 
   it('unlocks once the pull request itself is read again, without waiting for its files', async () => {

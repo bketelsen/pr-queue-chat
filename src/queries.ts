@@ -118,6 +118,32 @@ export async function refreshPullRequest(
   return shown.every((query) => query.state.status !== 'error');
 }
 
+/** Reloads a pull request's queries bypassing cached ETags (after a write or manual refresh). */
+export const reloadPullRequest = (queryClient: QueryClient, ref: PullRequestRef): Promise<void> =>
+  invalidateAfterWrite(queryClient, { queryKey: pullRequestKey(ref) });
+
+/** Records a confirmed merge in the summary cache so a stale pre-merge read cannot regress it. */
+export function markPullRequestMerged(
+  queryClient: QueryClient,
+  ref: PullRequestRef,
+  access: AccessKey
+): void {
+  const queryKey = keyOf(ref, access);
+  queryClient.setQueryData<PullRequest>(queryKey, (current) =>
+    current && !refusedData.has(current) && current.state !== 'merged'
+      ? { ...current, state: 'merged' }
+      : undefined
+  );
+}
+
+/** Reloads one active summary query bypassing cached ETags after a stale post-write read. */
+export const recheckStalePullRequest = (
+  queryClient: QueryClient,
+  ref: PullRequestRef,
+  access: AccessKey
+): Promise<void> =>
+  invalidateAfterWrite(queryClient, { queryKey: keyOf(ref, access), exact: true, type: 'active' });
+
 type QueryState = { state: { data: unknown; error: unknown } };
 
 // What a pull request's query read before GitHub refused it, until a read works again: no answer,
@@ -254,9 +280,27 @@ const pullRequestQuery = (
   queryFn: (context: QueryFunctionContext) => {
     const { client, queryKey, signal } = context;
     const read = () => {
+      const query = client.getQueryCache().get(client.defaultQueryOptions({ queryKey }).queryHash);
+      const reload = query !== undefined && writeRefreshes.has(query);
       const before = client.getQueryData<PullRequest>(queryKey);
-      return fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal).then(
-        (pr) => (before && refusedData.delete(before), pr),
+      return fetchPullRequest(ref as PullRequestRef, access.authFor(access.key), signal, {
+        reload,
+      }).then(
+        (pr) => {
+          const current = client.getQueryData<PullRequest>(queryKey);
+          if (
+            current !== undefined &&
+            !refusedData.has(current) &&
+            current.state === 'merged' &&
+            pr.state !== 'merged' &&
+            current.nodeId !== '' &&
+            current.nodeId === pr.nodeId
+          ) {
+            return current;
+          }
+          if (before) refusedData.delete(before);
+          return pr;
+        },
         (error: unknown) => {
           if (before && refused(error)) refusedData.add(before);
           throw error;
@@ -277,7 +321,11 @@ export function usePullRequest(ref: PullRequestRef | undefined, options: Refetch
 
 // GitHub computes whether a pull request merges after its base moved, in about a second; until
 // then its `mergeable` is null. It is read again after each of these, while it still is.
-const MERGEABLE_RECHECKS = [1_000, 2_000, 4_000];
+const MERGEABLE_RECHECKS = [1_000, 2_000, 4_000] as const;
+
+// Single best-effort reload delay when a reversible post-write read returns stale pre-write state,
+// reusing the initial GitHub propagation interval rather than polling across the 60s cache window.
+export const POST_WRITE_RECHECK_MS = MERGEABLE_RECHECKS[0];
 
 /**
  * While GitHub still computes whether the open pull request `pr` merges (`mergeable` null), reads

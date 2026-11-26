@@ -38,7 +38,7 @@ import {
   type PullRequestRef,
 } from '../github';
 import {
-  pullRequestKey,
+  reloadPullRequest,
   repositoryKey,
   useChecks,
   useHeadBranchSha,
@@ -80,15 +80,18 @@ const SHOWN_DONE: ReadonlySet<PullRequestAction> = new Set([
   'update-branch-rebase',
 ]);
 
+// Results whose outcome has already been reflected by a loaded pull request stay announcement-only
+// even if the pull request later changes elsewhere (e.g. converted to draft, then marked ready).
+const confirmedResults = new WeakSet<ActionResult>();
+
 /**
  * Whether a success is only announced, not shown as a line: the header shows it itself. Not
- * while the pull request could not be read again after the action and the one on screen is
- * still from before it: the header then offers Merge on a merged pull request, and the line is
- * all that says it is merged.
+ * while the pull request on screen is still awaiting confirmation of the action (whether the read
+ * failed or returned stale state): the line is then what says the action succeeded.
  */
 function isOnlyAnnounced(result: ActionResult | null, pr: PullRequest): boolean {
   if (result?.outcome !== 'done' || SHOWN_DONE.has(result.action)) return false;
-  return result.unread !== true || showsOutcome(pr, result.action);
+  return confirmedResults.has(result) || showsOutcome(pr, result.action);
 }
 
 /**
@@ -224,7 +227,7 @@ export function useHeaderActions({
     run();
   };
   const refresh = () => {
-    void queryClient.invalidateQueries({ queryKey: pullRequestKey(pullRequestRef) });
+    void reloadPullRequest(queryClient, pullRequestRef);
     void queryClient.invalidateQueries({ queryKey: repositoryKey(pullRequestRef) });
   };
 
@@ -532,6 +535,10 @@ export function useHeaderActions({
       ) : null}
     </>
   );
+  const resultAnnounced = isOnlyAnnounced(result, pr);
+  useEffect(() => {
+    if (result && resultAnnounced) confirmedResults.add(result);
+  }, [result, resultAnnounced]);
   const lines = (
     <>
       {removal.failed ? (
@@ -545,7 +552,7 @@ export function useHeaderActions({
           pending={pending}
           pendingShown={pending !== primaryAction}
           result={result}
-          resultAnnounced={isOnlyAnnounced(result, pr)}
+          resultAnnounced={resultAnnounced}
           onDismiss={dismissResult}
         />
       ) : null}
@@ -554,8 +561,7 @@ export function useHeaderActions({
   // What the lines show, not what the runner keeps: without write access they show none.
   const holds =
     removal.failed ||
-    (writable !== undefined &&
-      (pending !== null || (result !== null && !isOnlyAnnounced(result, pr))));
+    (writable !== undefined && (pending !== null || (result !== null && !resultAnnounced)));
   return { control: primaryControlElement, menu, lines, holds };
 }
 

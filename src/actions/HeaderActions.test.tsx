@@ -5,6 +5,7 @@ import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PullRequest, PullRequestRef } from '../github';
 import plugin from '../index';
+import { usePullRequest } from '../queries';
 import { useHeaderActions } from './HeaderActions';
 import {
   resetPullRequestActions,
@@ -593,6 +594,48 @@ describe('HeaderActions', () => {
     expect(view.queryByRole('button', { name: 'Dismiss' })).toBeNull();
   });
 
+  it('shows the merged status line without unread when the pull request is still open, then hides it once merged', async () => {
+    const done: ActionResult = { action: 'merge', outcome: 'done' };
+    const view = await renderPluginComponent(withResult(done, open), {
+      id: 'pull-requests',
+      plugin,
+    });
+    const status = view.getByRole('status');
+    expect(status.textContent).toBe('Pull request merged');
+    expect(status.className).toBe('mrpr-action-result');
+    expect(view.getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+    view.rerender(withResult(done, merged));
+    expect(status.className).toBe('mrpr-sr-only');
+    expect(view.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+  });
+
+  it('keeps a confirmed action announcement-only even if the pull request later changes elsewhere', async () => {
+    const draftPr: PullRequest = { ...open, draft: true };
+    const confirmed: ActionResult = { action: 'draft', outcome: 'done' };
+    const view = await renderPluginComponent(withResult(confirmed, draftPr), {
+      id: 'pull-requests',
+      plugin,
+    });
+    expect(view.getByRole('status').className).toBe('mrpr-sr-only');
+    expect(view.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+    // Marked ready later on GitHub: the old "Converted to draft" line must not reappear.
+    view.rerender(withResult(confirmed, open));
+    expect(view.getByRole('status').className).toBe('mrpr-sr-only');
+    expect(view.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+
+    // Same once a stale post-write read catches up and later changes elsewhere.
+    const staleThenConfirmed: ActionResult = { action: 'draft', outcome: 'done' };
+    view.rerender(withResult(staleThenConfirmed, open));
+    expect(view.getByRole('status').className).toBe('mrpr-action-result');
+    expect(view.getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+    view.rerender(withResult(staleThenConfirmed, draftPr));
+    expect(view.getByRole('status').className).toBe('mrpr-sr-only');
+    expect(view.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+    view.rerender(withResult(staleThenConfirmed, open));
+    expect(view.getByRole('status').className).toBe('mrpr-sr-only');
+    expect(view.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+  });
+
   it('draws no Merge button on a merged pull request', async () => {
     const view = await show(merged);
     await waitUntil(() => expect(moreActions(view)).toBeTruthy());
@@ -607,6 +650,28 @@ describe('HeaderActions', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['pull-requests', 'pr', 'o', 'r', 7] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['pull-requests', 'repo', 'o', 'r'] });
     expect(writes()).toEqual([]);
+  });
+
+  it('passes cache reload on manual Refresh', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((url, init) =>
+      url === PULL
+        ? Promise.resolve(respond({ title: 'T', state: 'open', node_id: 'PR_kw7' }))
+        : base(url, init)
+    );
+    const WithQuery = () => <Harness pullRequest={usePullRequest(ref).data ?? open} />;
+    const view = await renderPluginComponent(
+      <QueryClientProvider client={client}>
+        <WithQuery />
+      </QueryClientProvider>,
+      { id: 'pull-requests', plugin }
+    );
+    const pullCalls = () => fetchMock.mock.calls.filter(([url]) => url === PULL);
+    await waitUntil(() => expect(pullCalls()).toHaveLength(1));
+    await openMenu(view);
+    await click(row(view, 'Refresh'));
+    await waitUntil(() => expect(pullCalls()).toHaveLength(2));
+    expect(pullCalls().map(([, init]) => init?.cache)).toEqual(['no-cache', 'reload']);
   });
 
   // Disabled for the click and for a screen reader, yet still able to hold the focus.
@@ -673,20 +738,26 @@ describe('HeaderActions', () => {
       announcedOnly(view);
       await answerHeld();
       await waitUntil(() => expect(region.textContent).toBe('Pull request merged'));
+      view.rerender(ui(merged));
       expect(status(view)).toBe(region);
       announcedOnly(view);
     });
 
     it.each([
-      ['Convert to draft', 'Converted to draft'],
-      ['Enable auto-merge', 'Auto-merge enabled'],
-    ])("announces the outcome of the menu's %s", async (name, outcome) => {
+      ['Convert to draft', 'Converted to draft', { ...blocked, draft: true }],
+      [
+        'Enable auto-merge',
+        'Auto-merge enabled',
+        { ...blocked, autoMerge: { method: 'squash' as const } },
+      ],
+    ])("announces the outcome of the menu's %s", async (name, outcome, after) => {
       writeAnswer = async () => respond({ data: {} });
       const view = await show(blocked);
       await openMenu(view);
       await click(row(view, name));
       if (name === 'Enable auto-merge') await click(row(view, 'Confirm auto-merge?'));
       await waitUntil(() => expect(status(view).textContent).toBe(outcome));
+      view.rerender(ui(after));
       announcedOnly(view);
     });
 
