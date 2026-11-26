@@ -239,7 +239,7 @@ const byTime = (left: ConversationItem, right: ConversationItem) =>
 
 // A review without a body only holds line comments, which come as threads, or a verdict, which
 // the reviewers row and the timeline's verdicts show.
-const hasBody = (review: Review) => review.body.trim().length > 0;
+const hasBody = (review: Review) => visibleBody(review.body) !== null;
 
 /**
  * The Summary tab's conversations: the comments, the reviews written with a body, and the review
@@ -395,7 +395,13 @@ export function baseFreshness(
   return behind > 0 || conflicts ? { behind, conflicts } : undefined;
 }
 
-/** A body that is only HTML comments (a bot's markers) and whitespace is empty; any other is kept. */
+/**
+ * A body that is only HTML comments (a bot's markers) and whitespace is empty; any other is kept.
+ * Non-blank lines indented as a CommonMark code block (4 spaces or a tab) stay kept so comments
+ * inside indented code are never discarded before the Markdown renderer runs.
+ */
 export function visibleBody(body: string): string | null {
-  return body.replace(/<!--[\s\S]*?-->/gu, '').trim().length === 0 ? null : body.trim();
+  const outsideBlockComments = body.replace(/(^|\n) {0,3}<!--[\s\S]*?-->/gu, '$1');
+  if (/(?:^|\n)(?: {4}| {0,3}\t)[ \t]*\S/u.test(outsideBlockComments)) return body;
+  return body.replace(/<!--[\s\S]*?-->/gu, '').trim().length === 0 ? null : body;
 }

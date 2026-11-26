@@ -15,20 +15,43 @@ vi.mock('focus-trap-react', async () => ({
 
 // The app's Markdown renderer loads on demand and cannot load here; this one renders bold text,
 // and an image where `imageSource` gives it an address, as the app's sanitizer keeps it.
+const markdownMock = vi.hoisted(() => ({
+  ready: true,
+  inputs: [] as string[],
+  commonMarkHtml: [] as (boolean | undefined)[],
+}));
 vi.mock('@mindroom/client-sdk/ui', async (importOriginal) => {
   const ui = await importOriginal<typeof import('@mindroom/client-sdk/ui')>();
   return {
     ...ui,
     useMarkdownHtml: (
       markdown: string,
-      options?: { imageSource?: (src: string) => string | undefined }
-    ) =>
-      markdown
+      options?: {
+        imageSource?: (src: string) => string | undefined;
+        commonMarkHtml?: boolean;
+      }
+    ) => {
+      markdownMock.inputs.push(markdown);
+      markdownMock.commonMarkHtml.push(options?.commonMarkHtml);
+      if (!markdownMock.ready) return undefined;
+      if (/^(?: {4}| {0,3}\t)[ \t]*\S/u.test(markdown)) {
+        const code = markdown
+          .replace(/^(?: {4}| {0,3}\t)/gmu, '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+        return `<pre><code>${code}</code></pre>`;
+      }
+      const source = options?.commonMarkHtml
+        ? markdown.replace(/<!--[\s\S]*?(?:-->|$)/gu, '').trim()
+        : markdown;
+      return source
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
         .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt: string, src: string) => {
           const mapped = options?.imageSource?.(src);
           return mapped ? `<img alt="${alt}" src="${mapped}">` : '';
-        }),
+        });
+    },
   };
 });
 
@@ -159,6 +182,9 @@ beforeEach(() => {
   localStorage.clear();
   fetchMock.mockReset();
   serve();
+  markdownMock.ready = true;
+  markdownMock.inputs = [];
+  markdownMock.commonMarkHtml = [];
   vi.stubGlobal('fetch', fetchMock);
   // jsdom has no scrollIntoView.
   Element.prototype.scrollIntoView = vi.fn();
@@ -336,9 +362,57 @@ describe('SummaryTab', () => {
     expect(fetchMock.mock.calls.length).toBe(fetches);
   });
 
-  it('says so when there is no description', async () => {
-    const view = await show(pull({ body: '' }));
-    expect(view.getByText('No description.')).toBeTruthy();
+  it('says so when there is no description or only HTML comments', async () => {
+    const empty = await show(pull({ body: '' }));
+    expect(empty.getByText('No description.')).toBeTruthy();
+    empty.unmount();
+    const commentOnly = await show(pull({ body: '<!-- auto-generated note -->\n  ' }));
+    expect(commentOnly.getByText('No description.')).toBeTruthy();
+    commentOnly.unmount();
+    const unclosed = await show(pull({ body: '<!-- unclosed' }));
+    expect(unclosed.getByText('No description.')).toBeTruthy();
+    expect(markdownMock.commonMarkHtml.at(-1)).toBe(true);
+  });
+
+  it('distinguishes an unindented HTML comment from a 4-space indented code block', async () => {
+    const unindented = await show(pull({ body: '<!-- template marker -->' }));
+    expect(unindented.getByText('No description.')).toBeTruthy();
+    expect(unindented.container.querySelector('.mrpr-description pre code')).toBeNull();
+    unindented.unmount();
+
+    const indentedBody = '    <!-- template marker -->';
+    const indented = await show(pull({ body: indentedBody }));
+    expect(indented.queryByText('No description.')).toBeNull();
+    expect(markdownMock.inputs.at(-1)).toBe(indentedBody);
+    expect(markdownMock.commonMarkHtml.at(-1)).toBe(true);
+    expect(indented.container.querySelector('.mrpr-description pre code')?.textContent).toBe(
+      '<!-- template marker -->'
+    );
+  });
+
+  it('shows plain description while markdown loads, strips comments via SDK, and links verified refs', async () => {
+    const body = '<!-- auto-generated note -->\nFixes #42';
+    const bodyMeta = {
+      links: { '#42': 'https://github.com/acme/widgets/issues/42' },
+      commits: {},
+      videos: {},
+    };
+    markdownMock.ready = false;
+    try {
+      const view = await show(pull({ body, bodyMeta }));
+      const plain = view.container.querySelector('.mrpr-markdown.mrpr-comment-plain');
+      expect(plain?.textContent).toBe(body);
+      expect(markdownMock.commonMarkHtml).toContain(true);
+      markdownMock.ready = true;
+      view.unmount();
+      const rendered = await show(pull({ body, bodyMeta }));
+      const link = rendered.container.querySelector('.mrpr-description a');
+      expect(link?.getAttribute('href')).toBe('https://github.com/acme/widgets/issues/42');
+      expect(link?.textContent).toBe('#42');
+      expect(rendered.container.querySelector('.mrpr-description')?.textContent).toBe('Fixes #42');
+    } finally {
+      markdownMock.ready = true;
+    }
   });
 
   it('checks section lists checks collapsed by default', async () => {

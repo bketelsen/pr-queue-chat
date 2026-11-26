@@ -22,7 +22,11 @@ vi.mock('./detail.logic', async (importOriginal) => {
 
 vi.mock('@mindroom/client-sdk/ui', async (importOriginal) => {
   const ui = await importOriginal<typeof import('@mindroom/client-sdk/ui')>();
-  return { ...ui, useMarkdownHtml: (markdown: string) => markdown };
+  return {
+    ...ui,
+    useMarkdownHtml: (markdown: string, options?: { commonMarkHtml?: boolean }) =>
+      options?.commonMarkHtml ? markdown.replace(/<!--[\s\S]*?(?:-->|$)/gu, '').trim() : markdown,
+  };
 });
 
 const REF: PullRequestRef = { owner: 'mindroom-ai', repo: 'mindroom-chat', number: 200 };
@@ -197,6 +201,20 @@ describe('TimelineTab', () => {
     expect(events[4]).toContain('Pull request opened');
     // The thread shows expanded, with its path.
     expect(events[1]).toContain('src/a.ts:12');
+  });
+
+  it('omits CommentBody on a verdict review whose body is only HTML comments', async () => {
+    serve({
+      reviews: [
+        review(1, 'alice', 'APPROVED', {
+          submitted_at: at(10),
+          body: '<!-- auto-generated note -->',
+        }),
+      ],
+    });
+    const view = await show({ pullRequest: pull({ createdAt: at(0) }) });
+    await view.findByText('Approved');
+    expect(view.container.querySelector('.mrpr-comment-body')).toBeNull();
   });
 
   it('oldest first reverses', async () => {

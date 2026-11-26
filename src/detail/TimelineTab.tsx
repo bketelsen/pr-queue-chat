@@ -185,7 +185,7 @@ function VerdictEvent({ review, headSha }: { review: Review; headSha: string }) 
             <RelativeTime timestamp={review.submittedAt} />
           )}
         </span>
-        {review.body.trim() ? <CommentBody body={review.body} images={review.images} /> : null}
+        <CommentBody body={review.body} images={review.images} bodyMeta={review.bodyMeta} />
       </div>
     </li>
   );

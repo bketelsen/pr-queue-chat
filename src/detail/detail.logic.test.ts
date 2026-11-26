@@ -587,16 +587,58 @@ describe('baseFreshness', () => {
 });
 
 describe('visibleBody', () => {
-  it('drops a body that is nothing but a bot marker, and keeps one that says more', () => {
-    expect(visibleBody('<!-- MURMUR_IGNORE -->')).toBeNull();
+  it('drops comment-only bodies and preserves non-empty bodies including leading indentation', () => {
+    expect(visibleBody('<!-- auto-generated note -->')).toBeNull();
     expect(visibleBody('  <!-- a -->\n<!-- b -->\n ')).toBeNull();
     expect(visibleBody('')).toBeNull();
-    expect(visibleBody('<!-- summarize by coderabbit.ai -->\nNeeds a test.')).toBe(
-      '<!-- summarize by coderabbit.ai -->\nNeeds a test.'
+    expect(visibleBody('<!-- auto-generated note -->\nNeeds a test.')).toBe(
+      '<!-- auto-generated note -->\nNeeds a test.'
     );
+    expect(visibleBody('    indentedCode()')).toBe('    indentedCode()');
+  });
+
+  it('omits comment-only reviews from conversation items and timeline', () => {
+    const hidden = review(9, 'alice', 'COMMENTED', '2026-11-01T00:05:00Z', {
+      body: '<!-- auto-generated note -->',
+    });
+    expect(conversationItems([], [hidden], [], 'oldest')).toEqual([]);
+    expect(
+      buildTimeline({ ...TIMELINE_SOURCE, commits: [], comments: [], reviews: [hidden] }, 'oldest')
+    ).toHaveLength(1);
   });
 
   it('keeps a fenced HTML comment, which is text', () => {
     expect(visibleBody('```html\n<!-- kept -->\n```')).toBe('```html\n<!-- kept -->\n```');
+  });
+
+  it('keeps 4-space and tab-indented HTML comments (CommonMark indented code blocks)', () => {
+    expect(visibleBody('    <!-- template marker -->')).toBe('    <!-- template marker -->');
+    expect(visibleBody('\t<!-- template marker -->')).toBe('\t<!-- template marker -->');
+    expect(visibleBody('  \t<!-- template marker -->')).toBe('  \t<!-- template marker -->');
+    expect(visibleBody('<!-- header -->\n    <!-- template marker -->')).toBe(
+      '<!-- header -->\n    <!-- template marker -->'
+    );
+    expect(visibleBody('   <!-- not indented enough -->')).toBeNull();
+    expect(visibleBody('    ')).toBeNull();
+    expect(visibleBody('\t')).toBeNull();
+    expect(visibleBody('    \n<!-- template marker -->')).toBeNull();
+
+    const codeReview = review(10, 'alice', 'COMMENTED', '2026-11-01T00:06:00Z', {
+      body: '    <!-- template marker -->',
+    });
+    expect(conversationItems([], [codeReview], [], 'oldest')).toHaveLength(1);
+    expect(
+      buildTimeline(
+        { ...TIMELINE_SOURCE, commits: [], comments: [], reviews: [codeReview] },
+        'oldest'
+      )
+    ).toHaveLength(2);
+  });
+
+  it('drops multiline top-level HTML comments with indented placeholder lines', () => {
+    expect(visibleBody('<!--\n    Describe your change\n-->')).toBeNull();
+    expect(visibleBody('<!--\n\tDescribe your change\n-->')).toBeNull();
+    expect(visibleBody('   <!--\n    Describe your change\n-->')).toBeNull();
+    expect(visibleBody('<!--\n    a\n-->\n    code')).toBe('<!--\n    a\n-->\n    code');
   });
 });
