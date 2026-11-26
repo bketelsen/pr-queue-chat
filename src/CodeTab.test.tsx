@@ -21,6 +21,11 @@ import {
   type FileDiffMetadata,
 } from '@pierre/diffs';
 import { fnv1a32, getDiffLineStat } from './diff/diffRendering';
+import {
+  createFakeDiffWorkerClass,
+  withMockedCreateObjectURL,
+  type FakeDiffWorkerRecord,
+} from './testing/fakeDiffWorker';
 import { trapOptions } from './testing/focusTrapStandIn';
 import {
   greenhouseAfter,
@@ -54,39 +59,14 @@ const workerPool = vi.hoisted(() => ({
   props: undefined as
     | { poolOptions?: Record<string, unknown>; highlighterOptions?: Record<string, unknown> }
     | undefined,
-  created: [] as Array<{ terminate: ReturnType<typeof vi.fn> }>,
+  created: [] as FakeDiffWorkerRecord[],
 }));
 
-vi.mock('@pierre/diffs/worker/worker-portable.js?worker&inline', () => ({
-  default: class FakeDiffWorker {
-    listeners = new Map<string, Set<(event: unknown) => void>>();
-    terminate = vi.fn();
-    constructor() {
-      workerPool.created.push(this);
-    }
-    addEventListener(type: string, listener: (event: unknown) => void) {
-      const set = this.listeners.get(type) ?? new Set();
-      set.add(listener);
-      this.listeners.set(type, set);
-    }
-    postMessage(request: { id?: string; type?: string }) {
-      if (request.type === 'initialize') {
-        queueMicrotask(() => {
-          for (const listener of this.listeners.get('message') ?? []) {
-            listener({
-              data: {
-                type: 'success',
-                requestType: 'initialize',
-                id: request.id,
-                sentAt: Date.now(),
-              },
-            });
-          }
-        });
-      }
-    }
-  },
+vi.mock('@pierre/diffs/worker/worker-portable.js?raw', () => ({
+  default: '/* fake diff worker */',
 }));
+
+const FakeDiffWorker = createFakeDiffWorkerClass(workerPool.created);
 
 vi.mock('@pierre/diffs/react', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@pierre/diffs/react')>();
@@ -1099,26 +1079,45 @@ describe('CodeTab', () => {
     expect(view.props?.options).toMatchObject({ theme: 'pierre-dark' });
   });
 
-  it('mounts a single-worker pool when Worker is available and terminates it on unmount', async () => {
-    vi.stubGlobal('Worker', class FakeWorker {});
-    const tab = await show();
-    expect(view.props?.disableWorkerPool).toBe(false);
-    expect(workerPool.props?.poolOptions).toMatchObject({
-      poolSize: 1,
-      totalASTLRUCacheSize: 50,
-    });
-    expect(workerPool.props?.highlighterOptions).toEqual({
-      theme: { light: 'pierre-light', dark: 'pierre-dark' },
-      lineDiffType: 'none',
-      langs: [],
-    });
-    await vi.waitFor(() => expect(workerPool.created).toHaveLength(1), { timeout: 10_000 });
-    expect(workerPool.created[0].terminate).not.toHaveBeenCalled();
+  it('mounts a single-worker pool, reuses one Blob URL across opens, and terminates on unmount', async () => {
+    const createObjectURL = vi.fn(
+      (_blob: Blob) => `blob:diff-worker-${createObjectURL.mock.calls.length}`
+    );
+    await withMockedCreateObjectURL(createObjectURL, async () => {
+      vi.stubGlobal('Worker', FakeDiffWorker);
+      const firstOpen = await show();
+      expect(view.props?.disableWorkerPool).toBe(false);
+      expect(workerPool.props?.poolOptions).toMatchObject({
+        poolSize: 1,
+        totalASTLRUCacheSize: 50,
+      });
+      expect(workerPool.props?.highlighterOptions).toEqual({
+        theme: { light: 'pierre-light', dark: 'pierre-dark' },
+        lineDiffType: 'none',
+        langs: [],
+      });
+      await vi.waitFor(() => expect(workerPool.created).toHaveLength(1), { timeout: 10_000 });
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
+      expect(createObjectURL.mock.calls[0]?.[0]).toBeInstanceOf(Blob);
+      expect(createObjectURL.mock.calls[0]?.[0].type).toBe('text/javascript;charset=utf-8');
+      expect(workerPool.created[0].url).toBe('blob:diff-worker-1');
+      expect(workerPool.created[0].terminate).not.toHaveBeenCalled();
 
-    await act(async () => {
-      tab.unmount();
+      await act(async () => {
+        firstOpen.unmount();
+      });
+      expect(workerPool.created[0].terminate).toHaveBeenCalledTimes(1);
+
+      const secondOpen = await show();
+      await vi.waitFor(() => expect(workerPool.created).toHaveLength(2), { timeout: 10_000 });
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
+      expect(workerPool.created[1].url).toBe('blob:diff-worker-1');
+
+      await act(async () => {
+        secondOpen.unmount();
+      });
+      expect(workerPool.created[1].terminate).toHaveBeenCalledTimes(1);
     });
-    expect(workerPool.created[0].terminate).toHaveBeenCalledTimes(1);
   });
 
   it('keeps CodeView options, header, and footer props stable across unrelated UI toggles', async () => {
