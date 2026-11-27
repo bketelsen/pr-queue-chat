@@ -49,35 +49,35 @@ class BrowserTokenAccessKey {
   }
 }
 
-let tokenGeneration = 0;
-const tokenKeys = new Map<number, BrowserTokenAccessKey>();
-const tokenAccessKey = (generation: number): BrowserTokenAccessKey => {
-  let key = tokenKeys.get(generation);
-  if (key === undefined) {
-    key = new BrowserTokenAccessKey(generation);
-    tokenKeys.set(generation, key);
-  }
-  return key;
-};
+const FIRST_BROWSER_KEY = new BrowserTokenAccessKey(0);
+const browserCredentials = new WeakMap<
+  QueryClient,
+  { token: string | undefined; key: BrowserTokenAccessKey }
+>();
 
-/** The access key of the token stored in this browser now, which never holds the token itself. */
-export const browserTokenAccessKey = (): BrowserTokenAccessKey => tokenAccessKey(tokenGeneration);
+/** The access key of this session's observed browser credential, with no token in the key. */
+export const browserTokenAccessKey = (queryClient: QueryClient): BrowserTokenAccessKey =>
+  browserCredentials.get(queryClient)?.key ?? FIRST_BROWSER_KEY;
+
+function observeBrowserToken(queryClient: QueryClient, token: string | undefined, force = false) {
+  const before = browserCredentials.get(queryClient);
+  if (before && before.token === token && !force) return before.key;
+  const key = before ? new BrowserTokenAccessKey(before.key.generation + 1) : FIRST_BROWSER_KEY;
+  browserCredentials.set(queryClient, { token, key });
+  return key;
+}
 
 // Every card and panel reads the token from storage; this set tells all of them at once when one
 // of them changes it.
 const listeners = new Set<() => void>();
 const notify = () => listeners.forEach((listener) => listener());
-const onStorage = (event: StorageEvent) => {
-  if (event.key?.endsWith('/pull-requests/githubToken')) tokenGeneration += 1;
-  notify();
-};
 const subscribe = (listener: () => void) => {
   listeners.add(listener);
-  // Another tab of the same account changes it too.
-  if (listeners.size === 1) window.addEventListener('storage', onStorage);
+  // A storage event tells other tabs to re-read the credential; mounting also re-reads it.
+  if (listeners.size === 1) window.addEventListener('storage', notify);
   return () => {
     listeners.delete(listener);
-    if (listeners.size === 0) window.removeEventListener('storage', onStorage);
+    if (listeners.size === 0) window.removeEventListener('storage', notify);
   };
 };
 
@@ -90,27 +90,25 @@ export function useGitHubToken(): {
   const storage = usePluginStorage('pull-requests');
   const queryClient = useQueryClient();
   const token = useSyncExternalStore(subscribe, () => storage.getItem(KEY)) ?? undefined;
-  const changed = useCallback(
-    (stored: boolean) => {
-      tokenGeneration += 1;
-      notify();
-      // What the old token (or none) was refused says nothing about the new one, and results
-      // fetched with it may differ now. Each saved token has its own key generation, so what
-      // shows under the new one is read again here, with the new token.
-      readAgain(queryClient, stored ? tokenAccessKey(tokenGeneration) : undefined);
-    },
-    [queryClient]
-  );
+  const changed = useCallback(() => {
+    const stored = storage.getItem(KEY) ?? undefined;
+    const key = observeBrowserToken(queryClient, stored, true);
+    notify();
+    // What the old token (or none) was refused says nothing about the new one, and results
+    // fetched with it may differ now. Each saved token has its own key generation, so what
+    // shows under the new one is read again here, with the new token.
+    readAgain(queryClient, stored === undefined ? undefined : key);
+  }, [queryClient, storage]);
   return useMemo(
     () => ({
       token,
       setToken: (value: string) => {
         storage.setItem(KEY, value);
-        changed(true);
+        changed();
       },
       forget: () => {
         storage.removeItem(KEY);
-        changed(false);
+        changed();
       },
     }),
     [changed, storage, token]
@@ -776,6 +774,9 @@ export function useGitHubAccess(): GitHubAccess {
   const { server, pending: serverPending } = useContext(GitHubServerContext);
   const userId = useMatrixClient().getSafeUserId();
   const queryClient = useQueryClient();
+  const browserKey = useSyncExternalStore(subscribe, () =>
+    observeBrowserToken(queryClient, storedToken())
+  );
   const origin = server?.origin ?? '';
   const credential = useSyncExternalStore(subscribe, () => credentialOf(queryClient, origin));
   const status = useQuery({
@@ -799,7 +800,8 @@ export function useGitHubAccess(): GitHubAccess {
     server !== undefined && token === undefined && status.data?.unreadable === true;
   const current = useCallback((): { key: AccessKey; auth: GitHubAuth | undefined } => {
     const stored = storedToken();
-    if (stored !== undefined) return { key: tokenAccessKey(tokenGeneration), auth: stored };
+    const key = observeBrowserToken(queryClient, stored);
+    if (stored !== undefined) return { key, auth: stored };
     const now = server && queryClient.getQueryData<ServerStatus>(statusKey(server.origin));
     if (!server || !now?.connected) return { key: false, auth: undefined };
     const { generation, writing } = credentialOf(queryClient, server.origin);
@@ -840,7 +842,7 @@ export function useGitHubAccess(): GitHubAccess {
       // While a token is saved or removed there, the key before: what was read stays on screen.
       key:
         token !== undefined
-          ? tokenAccessKey(tokenGeneration)
+          ? browserKey
           : connected
             ? serverKey(origin, login, credential.generation - (credential.writing ? 1 : 0))
             : false,
@@ -856,6 +858,7 @@ export function useGitHubAccess(): GitHubAccess {
     [
       appConnected,
       authFor,
+      browserKey,
       connected,
       connection,
       credential,

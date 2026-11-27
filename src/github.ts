@@ -282,6 +282,9 @@ async function readGitHub(
     // An aborted request is the caller's own doing, not a failure of GitHub.
     if (signal?.aborted || (maxBytes !== undefined && isPermanentDiffBlobRefusal(error)))
       throw error;
+    if (error instanceof MindroomServerError && error.status === 403) {
+      throw new GitHubError('failed', 403);
+    }
     throw new GitHubError('failed', 0);
   }
   if (!response.ok) {

@@ -452,7 +452,7 @@ describe('PullRequestQueue', () => {
       queryClient.setQueryData(
         [
           ...pullRequestKey({ owner: 'mindroom-ai', repo: 'mindroom-chat', number: 1 }),
-          browserTokenAccessKey(),
+          browserTokenAccessKey(queryClient),
         ],
         {
           title: 'Optimistically merged',

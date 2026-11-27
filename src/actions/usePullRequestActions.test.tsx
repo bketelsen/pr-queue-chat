@@ -372,7 +372,8 @@ describe('usePullRequestActions', () => {
     const refused = () =>
       waitUntil(() =>
         expect(
-          client.getQueryState(['pull-requests', 'repo', 'o', 'r', browserTokenAccessKey()])?.status
+          client.getQueryState(['pull-requests', 'repo', 'o', 'r', browserTokenAccessKey(client)])
+            ?.status
         ).toBe('error')
       );
 
@@ -560,7 +561,7 @@ describe('usePullRequestActions', () => {
     expect(pullReads()[1]![1]?.cache).toBe('reload');
     await act(async () => {
       await client.refetchQueries({
-        queryKey: ['pull-requests', 'pr', 'o', 'r', 7, browserTokenAccessKey()],
+        queryKey: ['pull-requests', 'pr', 'o', 'r', 7, browserTokenAccessKey(client)],
       });
     });
     expect(shown?.state).toBe('merged');
@@ -569,7 +570,7 @@ describe('usePullRequestActions', () => {
       respond(apiPull({ state: 'closed', merged_at: '2026-11-16T00:00:00Z' }));
     await act(async () => {
       await client.refetchQueries({
-        queryKey: ['pull-requests', 'pr', 'o', 'r', 7, browserTokenAccessKey()],
+        queryKey: ['pull-requests', 'pr', 'o', 'r', 7, browserTokenAccessKey(client)],
       });
     });
     await waitUntil(() => expect(shown?.mergedAt).toBe('2026-11-16T00:00:00Z'));

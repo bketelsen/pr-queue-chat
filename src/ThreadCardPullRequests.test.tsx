@@ -539,8 +539,8 @@ describe('ThreadCardPullRequests', () => {
       'ghp_test'
     );
     const client = new QueryClient();
-    const first = [...pullRequestKey(sampleRef(1)), browserTokenAccessKey()];
-    client.setQueryData([...pullRequestKey(sampleRef(2)), browserTokenAccessKey()], {
+    const first = [...pullRequestKey(sampleRef(1)), browserTokenAccessKey(client)];
+    client.setQueryData([...pullRequestKey(sampleRef(2)), browserTokenAccessKey(client)], {
       state: 'merged',
     });
     try {

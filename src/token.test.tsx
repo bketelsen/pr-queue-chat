@@ -22,6 +22,7 @@ import {
   RoomGitHub,
   TokenForm,
   useGitHubAccess,
+  useGitHubToken,
   type GitHubAccess,
 } from './token';
 
@@ -200,7 +201,7 @@ describe('useGitHubAccess', () => {
     const server = serverWith(() => Promise.resolve({ connected: true, login: 'octo' }));
     await show(server);
     expect(accesses.a).toMatchObject({ via: 'token', pending: false });
-    expect(accesses.a?.key).toBe(browserTokenAccessKey());
+    expect(accesses.a?.key).toBe(browserTokenAccessKey(client));
     expect(JSON.stringify(accesses.a?.key)).not.toContain('ghp_test');
     expect(accesses.a?.current().auth).toBe('ghp_test');
     expect(server.request).not.toHaveBeenCalled();
@@ -220,6 +221,36 @@ describe('useGitHubAccess', () => {
     expect(JSON.stringify(accesses.a?.key)).toMatch(/^"token:\d+"$/);
     expect(JSON.stringify(accesses.a?.key)).not.toContain('ghp_second');
     expect(accesses.a?.current().auth).toBe('ghp_second');
+  });
+
+  it('reconciles a browser PAT changed while no reader was mounted', async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_first');
+    const view = await show(undefined);
+    const firstKey = accesses.a!.key;
+    await act(async () => view.unmount());
+    localStorage.setItem(TOKEN_KEY, 'ghp_second');
+    window.dispatchEvent(new StorageEvent('storage', { key: TOKEN_KEY, newValue: 'ghp_second' }));
+    await show(undefined);
+    expect(accesses.a!.key).not.toBe(firstKey);
+    expect(() => accesses.a!.authFor(firstKey)).toThrow(CancelledError);
+  });
+
+  it('gives mounted readers a new key when the same PAT is re-saved', async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_same');
+    function Save() {
+      const { setToken } = useGitHubToken();
+      return <button onClick={() => setToken('ghp_same')}>Save</button>;
+    }
+    const view = await show(
+      undefined,
+      <>
+        <Probe name="a" />
+        <Save />
+      </>
+    );
+    const firstKey = accesses.a!.key;
+    await act(async () => view.getByText('Save').click());
+    expect(accesses.a!.key).not.toBe(firstKey);
   });
 
   it('does not reuse a transient failure from the old browser token', async () => {

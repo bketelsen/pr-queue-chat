@@ -1781,6 +1781,15 @@ describe('through MindRoom', () => {
     expect(write.disconnected).toHaveBeenCalledTimes(1);
   });
 
+  it('preserves the authorization status of a proxy refusal', async () => {
+    const via = viaServer(() => {
+      throw new MindroomServerError('Forbidden', 403, {});
+    });
+    const error = await fetchPullRequest(ref, via).catch((error: unknown) => error);
+    expect(error).toMatchObject({ status: 403 });
+    expect(refused(error)).toBe(true);
+  });
+
   it('keeps the connection on any other refusal of the server', async () => {
     const via = viaServer(() => {
       throw new MindroomServerError('Unavailable', 503, { error: 'github_connection_unavailable' });
