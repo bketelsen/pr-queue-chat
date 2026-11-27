@@ -37,6 +37,9 @@ const QUEUE_REFETCH_MS = 5 * 60_000;
 // A merged pull request stays in Done for twelve hours from the time GitHub confirmed the merge.
 export const DONE_RETENTION_MS = 12 * 60 * 60_000;
 
+// The label GitHub carries on a pull request an agent has left for a person to review.
+const READY_FOR_HUMAN_LABEL = 'ready-for-human';
+
 type QueueAnswer = {
   pr: PullRequest | undefined;
   loading: boolean;
@@ -180,6 +183,7 @@ function QueueRow({ link, answer }: { link: QueueSourceLink; answer: QueueAnswer
   const { pullRequest } = link;
   const repository = `${pullRequest.owner}/${pullRequest.repo}`;
   const state = answer.pr ? resolvePullRequestState(answer.pr) : undefined;
+  const readyForHuman = answer.pr?.labels?.some(({ name }) => name === READY_FOR_HUMAN_LABEL);
   return (
     <li className="mrpr-queue-row">
       <div className="mrpr-queue-row-head">
@@ -194,6 +198,11 @@ function QueueRow({ link, answer }: { link: QueueSourceLink; answer: QueueAnswer
         </a>
         {state ? <QueueState state={state} /> : null}
       </div>
+      {readyForHuman ? (
+        <p className="mrpr-queue-ready">
+          <span className="mrpr-badge mrpr-badge-success">{t('queue.readyForHuman')}</span>
+        </p>
+      ) : null}
       {answer.pr ? (
         <p className="mrpr-queue-title">{answer.pr.title}</p>
       ) : (

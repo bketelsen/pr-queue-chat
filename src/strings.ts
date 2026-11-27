@@ -9,6 +9,8 @@ export const en = {
     done_other: 'Done ({{count}})',
     empty: 'No pull requests to show.',
     statusUnavailable: 'Status unavailable',
+    // The badge on a row whose summary carries GitHub's ready-for-human label.
+    readyForHuman: 'ready-for-human',
     merged: 'merged {{time}}',
   },
   openInSidePanel: 'Open in side panel',
