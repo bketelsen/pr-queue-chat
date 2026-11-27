@@ -26,9 +26,6 @@ export type QueueSourceLink = QueuePullRequestLink & { roomId: string };
 export const queueIdentity = (ref: PullRequestRef) =>
   `${ref.owner.toLowerCase()}/${ref.repo.toLowerCase()}#${ref.number}`;
 
-const refKeyOf = (ref: PullRequestRef) =>
-  `${ref.owner.toLowerCase()}/${ref.repo.toLowerCase()}#${ref.number}`;
-
 function contentOf(
   content: unknown,
   refKey: string
@@ -48,7 +45,7 @@ function contentOf(
     owner: parsed.owner.toLowerCase(),
     repo: parsed.repo.toLowerCase(),
   };
-  if (refKeyOf(pullRequest) !== refKey) return undefined;
+  if (queueIdentity(pullRequest) !== refKey) return undefined;
   return pullRequest;
 }
 

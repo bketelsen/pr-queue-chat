@@ -5,6 +5,7 @@ import {
   focusManager,
   notifyManager,
 } from '@tanstack/react-query';
+import type { PanelFrame } from '@mindroom/client-sdk/core';
 import {
   ClientEvent,
   RoomEvent,
@@ -17,8 +18,11 @@ import { renderPluginComponent } from '@mindroom/client-sdk/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import plugin from './index';
 import { PullRequestQueue } from './PullRequestQueue';
+import { pullRequestKey } from './queries';
+import { browserTokenAccessKey } from './token';
 import { THREAD_PULL_REQUEST_EVENT_TYPE } from './threadPullRequests';
 import { githubServer } from './testing/mindroomServer';
+import type { PullRequest } from './github';
 
 const OPENED_ROOM = '!opened:example.org';
 const OTHER_ROOM = '!other:example.org';
@@ -154,15 +158,27 @@ const serve = (pulls: Record<number, unknown>) =>
     return body === undefined ? respond({ message: 'Not Found' }, 404) : respond(body);
   });
 
-const show = async (roomId = OPENED_ROOM) => {
+const TOKEN_KEY = 'mindroom.plugin:%40plugin-tester%3Aexample.org/pull-requests/githubToken';
+
+const show = async (
+  roomId = OPENED_ROOM,
+  frame?: PanelFrame,
+  prepare?: (queryClient: QueryClient) => void
+) => {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const view = await renderPluginComponent(
+  prepare?.(queryClient);
+  const ui = () => (
     <QueryClientProvider client={queryClient}>
       <PullRequestQueue roomId={roomId} />
-    </QueryClientProvider>,
-    { id: 'pull-requests', plugin, client: matrix }
+    </QueryClientProvider>
   );
-  return { view, queryClient };
+  const view = await renderPluginComponent(ui(), {
+    id: 'pull-requests',
+    plugin,
+    client: matrix,
+    frame,
+  });
+  return { view, queryClient, ui };
 };
 type View = Awaited<ReturnType<typeof show>>['view'];
 
@@ -178,6 +194,7 @@ beforeEach(() => {
   client.rooms.length = 0;
   roomServer.current = undefined;
   roomServer.byRoom.clear();
+  localStorage.removeItem(TOKEN_KEY);
   fetchMock.mockReset();
   fetchMock.mockImplementation(async () => respond({ message: 'Not Found' }, 404));
   vi.stubGlobal('fetch', fetchMock);
@@ -299,11 +316,15 @@ describe('PullRequestQueue', () => {
   });
 
   it('reads a duplicate through the access of the room the panel opened in', async () => {
-    const openedServer = githubServer(async () =>
-      respond(pull('open', { title: 'Read from the opened room' }))
+    const openedServer = githubServer(
+      async () => respond(pull('open', { title: 'Read from the opened room' })),
+      undefined,
+      'https://opened.example.org'
     );
-    const otherServer = githubServer(async () =>
-      respond(pull('open', { title: 'Read from the other room' }))
+    const otherServer = githubServer(
+      async () => respond(pull('open', { title: 'Read from the other room' })),
+      undefined,
+      'https://other.example.org'
     );
     roomServer.byRoom.set(OPENED_ROOM, openedServer.server);
     roomServer.byRoom.set(OTHER_ROOM, otherServer.server);
@@ -315,6 +336,42 @@ describe('PullRequestQueue', () => {
     expect(view.queryByText('Read from the other room')).toBeNull();
     expect(openedServer.githubRequests()).toHaveLength(1);
     expect(otherServer.githubRequests()).toHaveLength(0);
+  });
+
+  it('clears the answers of a room left and rejoined, so another server never replays them', async () => {
+    const firstServer = githubServer(async () =>
+      respond(pull('open', { title: 'From the first server' }))
+    );
+    roomServer.byRoom.set(OPENED_ROOM, firstServer.server);
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
+    client.add(opened.room);
+
+    const { view } = await show();
+    await vi.waitFor(() => expect(active(view).textContent).toContain('From the first server'));
+
+    opened.membership('leave');
+    await act(async () => {
+      client.emit(RoomEvent.MyMembership, opened.room, 'leave', 'join');
+    });
+    await vi.waitFor(() => expect(allLinkNames(view)).toEqual([]));
+
+    let release = () => {};
+    const held = new Promise<Response>(
+      (resolve) => (release = () => resolve(respond(pull('open'))))
+    );
+    const secondServer = githubServer(() => held, undefined, 'https://second.example.org');
+    roomServer.byRoom.set(OPENED_ROOM, secondServer.server);
+    opened.membership('join');
+    await act(async () => {
+      client.emit(RoomEvent.MyMembership, opened.room, 'join', 'leave');
+    });
+
+    // The old server's title is gone before the new server answered.
+    expect(view.queryByText('From the first server')).toBeNull();
+    await act(async () => release());
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Store sessions in Redis'));
+    expect(firstServer.githubRequests()).toHaveLength(1);
+    expect(secondServer.githubRequests()).toHaveLength(1);
   });
 
   it('reclassifies a closed pull request as soon as a read says it is open again', async () => {
@@ -347,7 +404,24 @@ describe('PullRequestQueue', () => {
     expect(view.queryByTestId('pr-queue-done')).toBeNull();
   });
 
-  it('reads open pull requests again every five minutes while visible, and a merged one no more', async () => {
+  it('drops a cached private title when GitHub answers a plain 403', async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_private');
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
+    client.add(opened.room);
+    serve({ 1: pull('open', { title: 'Private work' }) });
+
+    const { view, queryClient } = await show();
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Private work'));
+
+    fetchMock.mockImplementation(async () => respond({ message: 'Forbidden' }, 403));
+    await act(async () => queryClient.invalidateQueries());
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Status unavailable'));
+    expect(view.queryByText('Private work')).toBeNull();
+    expect(linkNames(active(view))).toEqual(['mindroom-ai/mindroom-chat #1']);
+  });
+
+  it('reads with a token every five minutes while visible, and a valid merge no more', async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_test');
     focusManager.setFocused(true);
     vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
     vi.setSystemTime(new Date('2026-11-20T00:30:00Z'));
@@ -363,6 +437,109 @@ describe('PullRequestQueue', () => {
     await vi.waitFor(() => expect(pullRequests()).toHaveLength(3));
     expect(pullRequests().filter((number) => number === 1)).toHaveLength(2);
     expect(pullRequests().filter((number) => number === 2)).toHaveLength(1);
+  });
+
+  it('keeps polling an optimistic merge with no merge timestamp', async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_test');
+    focusManager.setFocused(true);
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    vi.setSystemTime(new Date('2026-11-20T00:30:00Z'));
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
+    client.add(opened.room);
+    serve({ 1: pull('open') });
+
+    const { view } = await show(OPENED_ROOM, undefined, (queryClient) => {
+      queryClient.setQueryData(
+        [
+          ...pullRequestKey({ owner: 'mindroom-ai', repo: 'mindroom-chat', number: 1 }),
+          browserTokenAccessKey(),
+        ],
+        {
+          title: 'Optimistically merged',
+          state: 'merged',
+          draft: false,
+          mergedAt: null,
+        } as PullRequest
+      );
+    });
+    expect(active(view).textContent).toContain('Optimistically merged');
+    expect(view.queryByTestId('pr-queue-done')).toBeNull();
+
+    await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
+    await vi.waitFor(() => expect(pullRequests()).toEqual([1]));
+  });
+
+  it('does not poll anonymously, but reads the public view and a stale one when shown again', async () => {
+    focusManager.setFocused(true);
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
+    client.add(opened.room);
+    serve({ 1: pull('open') });
+
+    const { view } = await show();
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Store sessions in Redis'));
+    expect(pullRequests()).toEqual([1]);
+
+    await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
+    expect(pullRequests()).toEqual([1]);
+
+    serve({ 1: pull('open', { title: 'Updated in public' }) });
+    await act(async () => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await vi.waitFor(() => expect(pullRequests()).toEqual([1, 1]));
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Updated in public'));
+  });
+
+  it('does not read while folded, and reads a stale answer when revealed', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const frame: PanelFrame = {
+      label: 'PR Queue',
+      layout: 'folded',
+      setLayout: vi.fn(),
+    };
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
+    client.add(opened.room);
+    serve({ 1: pull('open') });
+
+    const { view, ui } = await show(OPENED_ROOM, frame);
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+    expect(pullRequests()).toEqual([]);
+
+    frame.layout = 'beside';
+    await act(async () => view.rerender(ui()));
+    await vi.waitFor(() => expect(pullRequests()).toEqual([1]));
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Store sessions in Redis'));
+
+    frame.layout = 'folded';
+    await act(async () => view.rerender(ui()));
+    vi.setSystemTime(Date.now() + 121_000);
+    serve({ 1: pull('open', { title: 'Updated when revealed' }) });
+    frame.layout = 'beside';
+    await act(async () => view.rerender(ui()));
+    await vi.waitFor(() => expect(pullRequests()).toEqual([1, 1]));
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Updated when revealed'));
+  });
+
+  it('drops an already-expired merge submitted after the panel opened, by the real time', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-20T00:00:00Z'));
+    const opened = testRoom(OPENED_ROOM, []);
+    client.add(opened.room);
+
+    const { view } = await show();
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+    vi.setSystemTime(new Date('2026-11-20T01:00:00Z'));
+    serve({ 1: pull('merged', { merged_at: '2026-11-19T12:30:00Z' }) });
+    const event = opened.add({ number: 1 });
+    await act(async () => {
+      client.emit(RoomStateEvent.Events, event);
+    });
+
+    await vi.waitFor(() => expect(pullRequests()).toEqual([1]));
+    await vi.waitFor(() => expect(allLinkNames(view)).toEqual([]));
+    expect(view.queryByTestId('pr-queue-done')).toBeNull();
   });
 
   it('removes a Done row at exactly twelve hours, with a timer and no further read', async () => {

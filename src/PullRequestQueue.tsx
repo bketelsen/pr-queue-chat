@@ -1,6 +1,15 @@
 // The PR Queue side panel: every pull request submitted to a joined room, by the state events the
 // thread chips read, with each summary read through the access of the room that submitted it.
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { usePluginTranslation, usePanelFrame } from '@mindroom/client-sdk/core';
 import { useMatrixClient } from '@mindroom/client-sdk/matrix';
 import { pullRequestUrl, type PullRequest } from './github';
@@ -16,9 +25,9 @@ import {
   useJoinedRooms,
   type QueueSourceLink,
 } from './prQueue';
-import { answerOf, unlessRefused, usePullRequests } from './queries';
+import { answerOf, BACKGROUND_READ, unlessRefused, usePullRequests } from './queries';
 import { pluginRootStyle } from './theme';
-import { RoomGitHub } from './token';
+import { RoomGitHub, useGitHubAccess } from './token';
 import './prQueue.css';
 
 // The banner's button reads again at this interval while a pull request is still open or closed;
@@ -31,10 +40,9 @@ export const DONE_RETENTION_MS = 12 * 60 * 60_000;
 type QueueAnswer = {
   pr: PullRequest | undefined;
   loading: boolean;
-  failed: boolean;
 };
 
-const LOADING: QueueAnswer = { pr: undefined, loading: true, failed: false };
+const LOADING: QueueAnswer = { pr: undefined, loading: true };
 
 const answerKey = (roomId: string, identity: string) => `${roomId}\u0000${identity}`;
 
@@ -43,6 +51,20 @@ export function queueDoneAt(pr: PullRequest | undefined): number | undefined {
   if (pr?.state !== 'merged' || !pr.mergedAt) return undefined;
   const mergedAt = Date.parse(pr.mergedAt);
   return Number.isNaN(mergedAt) ? undefined : mergedAt + DONE_RETENTION_MS;
+}
+
+/**
+ * How often a summary is read again: only while the panel shows and only with a token or MindRoom's
+ * connection, an anonymous overview asking only when it opens and when a stale one is shown again.
+ * A valid merge is settled; an optimistic merge without its timestamp is not.
+ */
+export function queuePollInterval(
+  pr: PullRequest | undefined,
+  visible: boolean,
+  automatic: boolean
+): number | false {
+  if (!visible || !automatic) return false;
+  return queueDoneAt(pr) === undefined ? QUEUE_REFETCH_MS : false;
 }
 
 /** Whether the page, and the panel in it, is shown rather than folded or in a hidden tab. */
@@ -83,7 +105,8 @@ function useQueueNow(expiries: readonly number[], visible: boolean): number {
   useEffect(() => {
     if (visible) setNow(Date.now());
   }, [visible]);
-  return now;
+  // A submission that arrives late can already be past its expiry: the real time decides now.
+  return Math.max(now, Date.now());
 }
 
 /**
@@ -99,52 +122,55 @@ function QueueObserver({
   roomId: string;
   links: readonly QueueSourceLink[];
   visible: boolean;
-  onAnswers(
-    roomId: string,
-    links: readonly QueueSourceLink[],
-    answers: readonly QueueAnswer[]
-  ): void;
+  onAnswers(roomId: string, answers: readonly { identity: string; answer: QueueAnswer }[]): void;
 }) {
+  const access = useGitHubAccess();
   const queries = usePullRequests(
     links.map((link) => link.pullRequest),
     {
+      ...BACKGROUND_READ,
+      // Folded, nothing is read by itself; showing the panel again reads a stale answer anew.
+      enabled: visible ? unlessRefused : false,
       refetchOnMount: unlessRefused,
       retryOnMount: unlessRefused,
       refetchOnReconnect: unlessRefused,
       refetchOnWindowFocus: unlessRefused,
-      refetchInterval: (query) => {
-        if (!visible || !unlessRefused(query)) return false;
-        // A merge is settled; closed can still reopen, so it keeps being read.
-        const pr = query.state.data as PullRequest | undefined;
-        return pr?.state === 'merged' ? false : QUEUE_REFETCH_MS;
-      },
+      refetchInterval: (query) =>
+        unlessRefused(query)
+          ? queuePollInterval(
+              query.state.data as PullRequest | undefined,
+              visible,
+              access.via !== undefined
+            )
+          : false,
       refetchIntervalInBackground: false,
     }
   );
   const answers = queries.map((query): QueueAnswer => {
     const pr = answerOf(query);
-    return { pr, loading: query.isPending, failed: query.isError };
+    return { pr, loading: query.isPending };
   });
   const latest = useRef(answers);
   latest.current = answers;
-  const signature = links
-    .map((link, index) => {
-      const { pr, loading, failed } = answers[index] as QueueAnswer;
-      return [
-        queueIdentity(link.pullRequest),
-        pr?.title,
-        pr?.state,
-        pr?.draft,
-        pr?.mergedAt,
-        pr?.closedAt,
-        pr?.updatedAt,
-        loading,
-        failed,
-      ].join('\u0001');
-    })
-    .join('\n');
-  useEffect(() => {
-    onAnswers(roomId, links, latest.current);
+  // The query state tells when an answer or a refusal changed, without reading titles here.
+  const signature = JSON.stringify([
+    access.key,
+    ...queries.map((query) => [
+      query.dataUpdatedAt,
+      query.errorUpdatedAt,
+      query.status,
+      query.fetchStatus,
+    ]),
+  ]);
+  useLayoutEffect(() => {
+    onAnswers(
+      roomId,
+      links.map((link, index) => ({
+        identity: queueIdentity(link.pullRequest),
+        answer: latest.current[index] as QueueAnswer,
+      }))
+    );
+    return () => onAnswers(roomId, []);
   }, [links, onAnswers, roomId, signature]);
   return null;
 }
@@ -236,27 +262,27 @@ export function PullRequestQueue({ roomId }: { roomId: string }) {
 
   const [answers, setAnswers] = useState<ReadonlyMap<string, QueueAnswer>>(new Map());
   const onAnswers = useCallback(
-    (
-      sourceRoomId: string,
-      groupLinks: readonly QueueSourceLink[],
-      next: readonly QueueAnswer[]
-    ) => {
+    (sourceRoomId: string, next: readonly { identity: string; answer: QueueAnswer }[]) => {
       setAnswers((previous) => {
+        const prefix = `${sourceRoomId}\u0000`;
+        const current = new Set(next.map(({ identity }) => `${prefix}${identity}`));
         let changed = false;
         const updated = new Map(previous);
-        groupLinks.forEach((link, index) => {
-          const key = answerKey(sourceRoomId, queueIdentity(link.pullRequest));
-          const answer = next[index] as QueueAnswer;
+        // A link that left the room, or the room itself, leaves no answer behind to replay.
+        for (const key of previous.keys()) {
+          if (key.startsWith(prefix) && !current.has(key)) {
+            updated.delete(key);
+            changed = true;
+          }
+        }
+        for (const { identity, answer } of next) {
+          const key = `${prefix}${identity}`;
           const old = previous.get(key);
-          if (
-            old?.pr !== answer.pr ||
-            old?.loading !== answer.loading ||
-            old?.failed !== answer.failed
-          ) {
+          if (old?.pr !== answer.pr || old?.loading !== answer.loading) {
             updated.set(key, answer);
             changed = true;
           }
-        });
+        }
         return changed ? updated : previous;
       });
     },
@@ -295,45 +321,43 @@ export function PullRequestQueue({ roomId }: { roomId: string }) {
 
   return (
     <div className="mrpr-root mrpr-queue" style={pluginRootStyle()}>
-      <div className="mrpr-queue-scroll">
-        {shown.length === 0 ? <p className="mrpr-queue-note">{t('queue.empty')}</p> : null}
-        {active.length > 0 ? (
-          <section
-            className="mrpr-queue-section"
-            data-testid="pr-queue-active"
-            aria-labelledby={headingId}
-          >
-            <h2 id={headingId} className="mrpr-queue-heading">
-              {t('queue.active')}
-            </h2>
-            <ul className="mrpr-queue-list">
-              {active.map((entry) => (
-                <QueueRow
-                  key={`${entry.link.roomId}\u0000${queueIdentity(entry.link.pullRequest)}`}
-                  link={entry.link}
-                  answer={entry.answer}
-                />
-              ))}
-            </ul>
-          </section>
-        ) : null}
-        {done.length > 0 ? (
-          <details className="mrpr-queue-done" data-testid="pr-queue-done">
-            <summary className="mrpr-queue-done-summary">
-              {t('queue.done', { count: done.length })}
-            </summary>
-            <ul className="mrpr-queue-list">
-              {done.map((entry) => (
-                <QueueRow
-                  key={`${entry.link.roomId}\u0000${queueIdentity(entry.link.pullRequest)}`}
-                  link={entry.link}
-                  answer={entry.answer}
-                />
-              ))}
-            </ul>
-          </details>
-        ) : null}
-      </div>
+      {shown.length === 0 ? <p className="mrpr-queue-note">{t('queue.empty')}</p> : null}
+      {active.length > 0 ? (
+        <section
+          className="mrpr-queue-section"
+          data-testid="pr-queue-active"
+          aria-labelledby={headingId}
+        >
+          <h2 id={headingId} className="mrpr-queue-heading">
+            {t('queue.active')}
+          </h2>
+          <ul className="mrpr-queue-list">
+            {active.map((entry) => (
+              <QueueRow
+                key={`${entry.link.roomId}\u0000${queueIdentity(entry.link.pullRequest)}`}
+                link={entry.link}
+                answer={entry.answer}
+              />
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      {done.length > 0 ? (
+        <details className="mrpr-queue-done" data-testid="pr-queue-done">
+          <summary className="mrpr-queue-done-summary">
+            {t('queue.done', { count: done.length })}
+          </summary>
+          <ul className="mrpr-queue-list">
+            {done.map((entry) => (
+              <QueueRow
+                key={`${entry.link.roomId}\u0000${queueIdentity(entry.link.pullRequest)}`}
+                link={entry.link}
+                answer={entry.answer}
+              />
+            ))}
+          </ul>
+        </details>
+      ) : null}
       {observers}
     </div>
   );

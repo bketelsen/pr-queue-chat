@@ -10,6 +10,7 @@ import { pullRequestKey, refreshPullRequest, STALE_TIME } from './queries';
 import { FakeIntersectionObserver, observers, report } from './testing/intersectionObserver';
 import { linkedRoom, type TestLink, type TestWorktree } from './testing/linkedRoom';
 import { githubServer } from './testing/mindroomServer';
+import { browserTokenAccessKey } from './token';
 import { ThreadCardPullRequests } from './ThreadCardPullRequests';
 import { ThreadDetails } from './ThreadDetails';
 
@@ -538,8 +539,10 @@ describe('ThreadCardPullRequests', () => {
       'ghp_test'
     );
     const client = new QueryClient();
-    const first = [...pullRequestKey(sampleRef(1)), true];
-    client.setQueryData([...pullRequestKey(sampleRef(2)), true], { state: 'merged' });
+    const first = [...pullRequestKey(sampleRef(1)), browserTokenAccessKey()];
+    client.setQueryData([...pullRequestKey(sampleRef(2)), browserTokenAccessKey()], {
+      state: 'merged',
+    });
     try {
       onlineManager.setOnline(false);
       const view = await show(roomWith([1, 2].map(sampleRef)), { phone: true, client });

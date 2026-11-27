@@ -2,15 +2,11 @@
    disclosure. Classes share the plugin's mrpr- prefix and colors from pluginRootStyle(). */
 .mrpr-queue {
   box-sizing: border-box;
+  display: flex;
   block-size: 100%;
+  flex-direction: column;
   overflow: auto;
   padding: 1rem;
-}
-
-.mrpr-queue-scroll {
-  display: flex;
-  min-height: 100%;
-  flex-direction: column;
 }
 
 .mrpr-queue-section {

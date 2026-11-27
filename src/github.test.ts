@@ -20,6 +20,7 @@ import {
   filePatch,
   parsePullRequestUrl,
   pullRequestUrl,
+  refused,
   runPullRequestAction,
   type PullRequest,
   type PullRequestAction,
@@ -268,6 +269,11 @@ describe('fetchPullRequestFiles', () => {
 });
 
 describe('the error kinds', () => {
+  it('treats a non-rate-limit 403 as a refusal, so no earlier private answer stands', () => {
+    expect(refused(new GitHubError('failed', 403))).toBe(true);
+    expect(refused(new GitHubError('rateLimited', 403))).toBe(false);
+    expect(refused(new GitHubError('failed', 500))).toBe(false);
+  });
   async function failure(token: string | undefined, response: Response | Error) {
     vi.stubGlobal('fetch', () =>
       response instanceof Error ? Promise.reject(response) : Promise.resolve(response)
