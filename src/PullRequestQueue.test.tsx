@@ -266,6 +266,61 @@ describe('PullRequestQueue', () => {
     expect(active(view).textContent).toContain('Open');
   });
 
+  it('marks an active row ready for a human on its own line, from the summary labels', async () => {
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
+    client.add(opened.room);
+    serve({ 1: pull('open', { labels: [{ name: 'ready-for-human', color: '0e8a16' }] }) });
+
+    const { view } = await show();
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Store sessions in Redis'));
+    const row = active(view).querySelector('.mrpr-queue-row') as HTMLElement;
+    const ready = row.querySelector('.mrpr-queue-ready') as HTMLElement;
+    expect(ready.textContent).toBe('ready-for-human');
+    expect(ready.querySelector('.mrpr-badge-success')).toBeTruthy();
+    expect(row.querySelector('.mrpr-queue-row-head')?.textContent).not.toContain('ready-for-human');
+  });
+
+  it('marks a merged row in Done ready for a human too', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-20T00:30:00Z'));
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
+    client.add(opened.room);
+    serve({
+      1: pull('merged', { labels: [{ name: 'ready-for-human', color: '0e8a16' }] }),
+    });
+
+    const { view } = await show();
+    await vi.waitFor(() => expect(view.queryByTestId('pr-queue-done')).toBeTruthy());
+    expect(done(view).querySelector('.mrpr-queue-ready')?.textContent).toBe('ready-for-human');
+  });
+
+  it('shows no ready badge when the label is absent or the summary is unavailable', async () => {
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }, { number: 2 }]);
+    client.add(opened.room);
+    serve({ 1: pull('open', { labels: [{ name: 'bug', color: 'd73a4a' }] }), 2: undefined });
+
+    const { view } = await show();
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Store sessions in Redis'));
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Status unavailable'));
+    expect(active(view).querySelector('.mrpr-queue-ready')).toBeNull();
+    expect(view.queryByText('ready-for-human')).toBeNull();
+  });
+
+  it('removes the ready badge when a refresh no longer has the label', async () => {
+    const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
+    client.add(opened.room);
+    serve({ 1: pull('open', { labels: [{ name: 'ready-for-human', color: '0e8a16' }] }) });
+
+    const { view, queryClient } = await show();
+    await vi.waitFor(() => expect(active(view).textContent).toContain('Store sessions in Redis'));
+    expect(active(view).querySelector('.mrpr-queue-ready')?.textContent).toBe('ready-for-human');
+
+    serve({ 1: pull('open', { labels: [] }) });
+    await act(async () => queryClient.invalidateQueries());
+    await vi.waitFor(() => expect(active(view).querySelector('.mrpr-queue-ready')).toBeNull());
+    expect(active(view).textContent).toContain('Store sessions in Redis');
+  });
+
   it('takes a row out when its room is left and adds one when a room is joined or links change', async () => {
     const opened = testRoom(OPENED_ROOM, [{ number: 1 }]);
     client.add(opened.room);
