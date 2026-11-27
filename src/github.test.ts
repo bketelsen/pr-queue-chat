@@ -20,6 +20,7 @@ import {
   filePatch,
   parsePullRequestUrl,
   pullRequestUrl,
+  refused,
   runPullRequestAction,
   type PullRequest,
   type PullRequestAction,
@@ -268,6 +269,11 @@ describe('fetchPullRequestFiles', () => {
 });
 
 describe('the error kinds', () => {
+  it('treats a non-rate-limit 403 as a refusal, so no earlier private answer stands', () => {
+    expect(refused(new GitHubError('failed', 403))).toBe(true);
+    expect(refused(new GitHubError('rateLimited', 403))).toBe(false);
+    expect(refused(new GitHubError('failed', 500))).toBe(false);
+  });
   async function failure(token: string | undefined, response: Response | Error) {
     vi.stubGlobal('fetch', () =>
       response instanceof Error ? Promise.reject(response) : Promise.resolve(response)
@@ -1773,6 +1779,15 @@ describe('through MindRoom', () => {
       runPullRequestAction(writeRef, writePull, 'close', 'squash', write)
     ).rejects.toEqual(new GitHubWriteError('failed', 0));
     expect(write.disconnected).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the authorization status of a proxy refusal', async () => {
+    const via = viaServer(() => {
+      throw new MindroomServerError('Forbidden', 403, {});
+    });
+    const error = await fetchPullRequest(ref, via).catch((error: unknown) => error);
+    expect(error).toMatchObject({ status: 403 });
+    expect(refused(error)).toBe(true);
   });
 
   it('keeps the connection on any other refusal of the server', async () => {

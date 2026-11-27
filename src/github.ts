@@ -113,9 +113,16 @@ export class GitHubError extends Error {
   }
 }
 
-/** Whether GitHub refused what was asked (not found, or the token): asked again, it would refuse again. */
+/**
+ * Whether GitHub refused what was asked (not found, the token, or a non-rate-limit 403 such as a
+ * private repository's denied access): asked again, it would refuse again, and no earlier private
+ * answer stands beside it. A rate-limit 403 is a transient answer and keeps the last good one.
+ */
 export const refused = (error: unknown) =>
-  error instanceof GitHubError && (error.kind === 'notFound' || error.kind === 'badToken');
+  error instanceof GitHubError &&
+  (error.kind === 'notFound' ||
+    error.kind === 'badToken' ||
+    (error.status === 403 && error.kind !== 'rateLimited'));
 
 function errorKind(response: Response, hasToken: boolean): GitHubErrorKind {
   const { status } = response;
@@ -275,6 +282,9 @@ async function readGitHub(
     // An aborted request is the caller's own doing, not a failure of GitHub.
     if (signal?.aborted || (maxBytes !== undefined && isPermanentDiffBlobRefusal(error)))
       throw error;
+    if (error instanceof MindroomServerError && error.status === 403) {
+      throw new GitHubError('failed', 403);
+    }
     throw new GitHubError('failed', 0);
   }
   if (!response.ok) {

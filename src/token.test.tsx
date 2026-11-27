@@ -16,11 +16,13 @@ import plugin from './index';
 import { usePullRequest } from './queries';
 import { githubServer } from './testing/mindroomServer';
 import {
+  browserTokenAccessKey,
   GitHubServerContext,
   RemoveServerToken,
   RoomGitHub,
   TokenForm,
   useGitHubAccess,
+  useGitHubToken,
   type GitHubAccess,
 } from './token';
 
@@ -198,9 +200,92 @@ describe('useGitHubAccess', () => {
     localStorage.setItem(TOKEN_KEY, 'ghp_test');
     const server = serverWith(() => Promise.resolve({ connected: true, login: 'octo' }));
     await show(server);
-    expect(accesses.a).toMatchObject({ via: 'token', key: true, pending: false });
+    expect(accesses.a).toMatchObject({ via: 'token', pending: false });
+    expect(accesses.a?.key).toBe(browserTokenAccessKey(client));
+    expect(JSON.stringify(accesses.a?.key)).not.toContain('ghp_test');
     expect(accesses.a?.current().auth).toBe('ghp_test');
     expect(server.request).not.toHaveBeenCalled();
+  });
+
+  it("fences a changed browser token's answers with a new generation, never the token", async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_first');
+    await show(undefined);
+    const first = accesses.a?.key;
+    expect(JSON.stringify(first)).not.toContain('ghp_first');
+
+    localStorage.setItem(TOKEN_KEY, 'ghp_second');
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', { key: TOKEN_KEY, newValue: 'ghp_second' }));
+    });
+    await waitUntil(() => expect(accesses.a?.key).not.toBe(first));
+    expect(JSON.stringify(accesses.a?.key)).toMatch(/^"token:\d+"$/);
+    expect(JSON.stringify(accesses.a?.key)).not.toContain('ghp_second');
+    expect(accesses.a?.current().auth).toBe('ghp_second');
+  });
+
+  it('reconciles a browser PAT changed while no reader was mounted', async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_first');
+    const view = await show(undefined);
+    const firstKey = accesses.a!.key;
+    await act(async () => view.unmount());
+    localStorage.setItem(TOKEN_KEY, 'ghp_second');
+    window.dispatchEvent(new StorageEvent('storage', { key: TOKEN_KEY, newValue: 'ghp_second' }));
+    await show(undefined);
+    expect(accesses.a!.key).not.toBe(firstKey);
+    expect(() => accesses.a!.authFor(firstKey)).toThrow(CancelledError);
+  });
+
+  it('gives mounted readers a new key when the same PAT is re-saved', async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_same');
+    function Save() {
+      const { setToken } = useGitHubToken();
+      return <button onClick={() => setToken('ghp_same')}>Save</button>;
+    }
+    const view = await show(
+      undefined,
+      <>
+        <Probe name="a" />
+        <Save />
+      </>
+    );
+    const firstKey = accesses.a!.key;
+    await act(async () => view.getByText('Save').click());
+    expect(accesses.a!.key).not.toBe(firstKey);
+  });
+
+  it('does not reuse a transient failure from the old browser token', async () => {
+    localStorage.setItem(TOKEN_KEY, 'ghp_failed');
+    const respond = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { 'content-type': 'application/json' },
+      });
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const auth = new Headers(init?.headers).get('authorization');
+      return auth === 'Bearer ghp_failed'
+        ? respond({ message: 'Bad Gateway' }, 502)
+        : respond(apiPull);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await renderPluginComponent(tree(undefined, <NamedReader name="a" />), {
+      id: 'pull-requests',
+      plugin,
+    });
+    await waitUntil(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    const failed = accesses.a?.key;
+
+    localStorage.setItem(TOKEN_KEY, 'ghp_second');
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', { key: TOKEN_KEY, newValue: 'ghp_second' }));
+    });
+    await waitUntil(() => expect(accesses.a?.key).not.toBe(failed));
+    await waitUntil(() =>
+      expect(document.querySelector('[data-testid="a"]')?.textContent).toBe('T')
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const auth = new Headers(fetchMock.mock.calls[1]?.[1]?.headers).get('authorization');
+    expect(auth).toBe('Bearer ghp_second');
   });
 
   it.each([

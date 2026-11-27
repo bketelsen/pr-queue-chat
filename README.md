@@ -31,9 +31,20 @@ Click any pull request link or chip to open it beside the conversation (click ag
 
 - **PR status & worktree branches at a glance:** Compact thread cards display linked PRs with GitHub's native state colors (open, draft, merged, closed) and CI check marks, or the thread's git worktree branch when no PR is linked yet.
 - **Rich hover & thread details:** Hover any PR chip or link for an instant preview card (reviewers, labels, checks, branch status, diff stats), or open the thread header PR menu to browse every linked PR.
+- **PR Queue across joined rooms:** The **PR Queue** side panel lists pull requests submitted to any room you have joined, whether linked to a thread or submitted outside one. It deduplicates by repository and number, reads each summary through the access of the room that submitted it, and keeps a plain GitHub link visible when the status is unavailable. Merged pull requests move into a collapsed **Done** for 12 hours from the merge, then leave the panel while their thread links stay in Matrix.
 - **Review diffs without leaving chat:** The in-room side panel includes **Summary**, **Timeline**, and **Code** tabs with a resizable file tree, split or stacked syntax-highlighted diffs, inline review threads, commit selector, and per-file viewed marks.
 - **Merge, update, and manage PRs in place:** Maintainers with write access can merge (merge, squash, or rebase), toggle auto-merge, update branches behind base, mark drafts ready, close or reopen PRs, and safely delete merged branches right from the panel.
 - **Flexible GitHub authentication:** Public repos work read-only out of the box; private repos and write actions work seamlessly through MindRoom's GitHub connection or a personal access token stored in the browser.
+
+<details>
+<summary><b>PR Queue scope &amp; retention</b></summary>
+
+- **Joined rooms only:** The panel reads `com.mindroom.thread.pull_request` state from every room the signed-in account has joined. Invitations and rooms you left are not read.
+- **Both submission forms:** A thread link counts, as does a room-only submission with the compact key `[null,"<owner>/<repo>#<number>"]` and the usual `url`, `set_by`, `set_at` content. Empty content is a tombstone and is ignored.
+- **Source and deduplication:** Each repository and number appears once. A duplicate prefers the room the panel opened in, then the newest submission, then the room ID. Its summary is read through that source room's GitHub access.
+- **Done retention:** A valid merge time moves the pull request into a collapsed **Done**. It leaves the panel at `mergedAt + 12h`, including when it was submitted late. The timer runs while the panel is visible and needs no further GitHub request. Closed, reopened and unavailable pull requests stay outside **Done**; an unavailable one still shows its GitHub link.
+
+</details>
 
 ## Quick start
 

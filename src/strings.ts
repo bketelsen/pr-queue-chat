@@ -2,6 +2,15 @@
 // `usePluginTranslation('pull-requests')`.
 export const en = {
   panelLabel: 'Pull request',
+  queue: {
+    panelLabel: 'PR Queue',
+    active: 'Pull requests',
+    done_one: 'Done ({{count}})',
+    done_other: 'Done ({{count}})',
+    empty: 'No pull requests to show.',
+    statusUnavailable: 'Status unavailable',
+    merged: 'merged {{time}}',
+  },
   openInSidePanel: 'Open in side panel',
   openOnGitHub: 'Open on GitHub',
   copyLink: 'Copy link',

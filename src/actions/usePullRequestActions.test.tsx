@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GitHubWriteError, type PullRequest, type PullRequestRef } from '../github';
 import plugin from '../index';
 import { usePullRequest, usePullRequestFiles } from '../queries';
-import { GitHubServerContext, useGitHubToken } from '../token';
+import { GitHubServerContext, browserTokenAccessKey, useGitHubToken } from '../token';
 import { primaryControl } from './actions.logic';
 import { resetPullRequestActions, usePullRequestActions } from './usePullRequestActions';
 
@@ -371,9 +371,10 @@ describe('usePullRequestActions', () => {
     const allow = () => fetchMock.mockImplementation(async () => respond({ data: { repository } }));
     const refused = () =>
       waitUntil(() =>
-        expect(client.getQueryState(['pull-requests', 'repo', 'o', 'r', true])?.status).toBe(
-          'error'
-        )
+        expect(
+          client.getQueryState(['pull-requests', 'repo', 'o', 'r', browserTokenAccessKey(client)])
+            ?.status
+        ).toBe('error')
       );
 
     it('is asked for again, with the new token, in a panel opened after the token changed', async () => {
@@ -421,7 +422,7 @@ describe('usePullRequestActions', () => {
     });
   });
 
-  it('keeps what was read on screen while a changed token reads it again', async () => {
+  it("reads with the changed token without showing the old token's answer", async () => {
     await renderPluginComponent(
       <QueryClientProvider client={client}>
         <Token />
@@ -433,8 +434,8 @@ describe('usePullRequestActions', () => {
     pullAnswer = () => hold(() => respond(apiPull({ title: 'Read with the other token' })));
     act(() => token.setToken('other'));
     await waitUntil(() => expect(pullReads()).toHaveLength(2));
-    // No flash of the panel's loading state.
-    expect(shown?.title).toBe('T');
+    // The old token's answer is not shown under the new token, even while it reads.
+    expect(shown?.title).not.toBe('T');
     await answerHeld();
     await waitUntil(() => expect(shown?.title).toBe('Read with the other token'));
   });
@@ -559,14 +560,18 @@ describe('usePullRequestActions', () => {
     expect(primaryControl(shown!, actions.repo!, undefined)).toBe('merged');
     expect(pullReads()[1]![1]?.cache).toBe('reload');
     await act(async () => {
-      await client.refetchQueries({ queryKey: ['pull-requests', 'pr', 'o', 'r', 7, true] });
+      await client.refetchQueries({
+        queryKey: ['pull-requests', 'pr', 'o', 'r', 7, browserTokenAccessKey(client)],
+      });
     });
     expect(shown?.state).toBe('merged');
     expect(primaryControl(shown!, actions.repo!, undefined)).toBe('merged');
     pullAnswer = async () =>
       respond(apiPull({ state: 'closed', merged_at: '2026-11-16T00:00:00Z' }));
     await act(async () => {
-      await client.refetchQueries({ queryKey: ['pull-requests', 'pr', 'o', 'r', 7, true] });
+      await client.refetchQueries({
+        queryKey: ['pull-requests', 'pr', 'o', 'r', 7, browserTokenAccessKey(client)],
+      });
     });
     await waitUntil(() => expect(shown?.mergedAt).toBe('2026-11-16T00:00:00Z'));
     expect(shown?.state).toBe('merged');
