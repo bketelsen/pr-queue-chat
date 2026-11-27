@@ -1,0 +1,103 @@
+/* The PR Queue side panel: one list of submissions from every joined room and its Done
+   disclosure. Classes share the plugin's mrpr- prefix and colors from pluginRootStyle(). */
+.mrpr-queue {
+  box-sizing: border-box;
+  block-size: 100%;
+  overflow: auto;
+  padding: 1rem;
+}
+
+.mrpr-queue-scroll {
+  display: flex;
+  min-height: 100%;
+  flex-direction: column;
+}
+
+.mrpr-queue-section {
+  margin-block-end: 1rem;
+}
+
+.mrpr-queue-heading {
+  margin: 0 0 0.5rem;
+  color: var(--pr-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  line-height: 1rem;
+  text-transform: uppercase;
+}
+
+.mrpr-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mrpr-queue-row {
+  padding: 0.625rem 0.75rem;
+  border: 1px solid var(--pr-border);
+  border-radius: 0.5rem;
+  background: var(--pr-surface);
+}
+
+.mrpr-queue-row-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.mrpr-queue-link {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 0.25rem;
+  color: var(--pr-fg);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.mrpr-queue-link:hover {
+  text-decoration: underline;
+}
+
+.mrpr-queue-state {
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
+.mrpr-queue-title {
+  margin: 0.25rem 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+}
+
+.mrpr-queue-note {
+  margin: 0.25rem 0 0;
+  color: var(--pr-muted);
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
+.mrpr-queue-done {
+  margin-block-start: auto;
+  padding-block-start: 0.75rem;
+  border-block-start: 1px solid var(--pr-border);
+}
+
+.mrpr-queue-done-summary {
+  color: var(--pr-muted);
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.5rem;
+}
+
+.mrpr-queue-done .mrpr-queue-list {
+  margin-block-start: 0.5rem;
+}

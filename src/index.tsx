@@ -3,6 +3,7 @@ import { Icons } from 'folds';
 import type { ClientPlugin } from '@mindroom/client-sdk/core';
 import { parsePullRequestUrl } from './github';
 import { PullRequestCard } from './PullRequestCard';
+import { PullRequestQueue } from './PullRequestQueue';
 import { en } from './strings';
 import { ThreadCardPullRequests } from './ThreadCardPullRequests';
 import { PullRequestLinkHoverCard, ThreadDetails } from './ThreadDetails';
@@ -36,6 +37,14 @@ const plugin: ClientPlugin = {
       // replacing both the room's title row and its open frame strip.
       title: 'own',
       frameControls: 'own',
+    },
+    {
+      id: 'pr-queue',
+      label: 'queue.panelLabel',
+      icon: Icons.Inbox,
+      // Every joined room's submissions, in the room it opens in and the room menu elsewhere.
+      placement: 'menu',
+      Component: PullRequestQueue,
     },
   ],
   // Each chip opens its own hover card, so the card's details card stays closed over the chips.
